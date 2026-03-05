@@ -1,0 +1,113 @@
+---
+# =============================================================================
+# Nautobot → Nagios Sync Configuration
+# =============================================================================
+
+nautobot:
+  verify_ssl: true                           # Set false if using self-signed cert
+  timeout: 30                                # HTTP request timeout in seconds
+
+  # Filter: only sync devices/VMs with a primary IP assigned
+  require_primary_ip: true
+
+  # Filter: only sync active/staged devices (Nautobot statuses)
+  device_statuses:
+    - "active"
+    - "staged"
+
+  # Filter: only sync interfaces that have a cable connected
+  interfaces_connected_only: true
+
+  # Device roles that will be monitored via SNMP
+  snmp_roles:
+    - "switch"
+    - "router"
+    - "firewall"
+    - "access-point"
+
+  # Device roles that will be monitored via NRPE (Linux agent)
+  nrpe_roles:
+    - "server"
+    - "hypervisor"
+
+  # Device roles that are IP phones (ping only)
+  phone_roles:
+    - "ip-phone"
+    - "voip-phone"
+
+  # VM platform names that use NRPE
+  vm_nrpe_platforms:
+    - "linux"
+    - "ubuntu"
+    - "debian"
+    - "centos"
+    - "rhel"
+
+
+nagios:
+  # Path to Nagios config directory (where generated .cfg files will be written)
+  config_dir: "/etc/nagios/conf.d/nautobot"
+
+  # Path to Nagios status.dat (for live map data)
+  status_dat: "/var/cache/nagios3/status.dat"
+
+  # Path to nagios binary (for config validation)
+  nagios_bin: "/usr/sbin/nagios"
+
+  # Path to nagios main config (for validation)
+  nagios_cfg: "/etc/nagios3/nagios.cfg"
+
+  # Command to reload Nagios after config update
+  reload_command: "systemctl reload nagios"
+
+  # Default templates (must exist in your Nagios base config)
+  host_template: "generic-host"
+  service_template: "generic-service"
+
+  # Check intervals (minutes)
+  check_interval: 5
+  retry_interval: 1
+  max_check_attempts: 3
+
+  # Notification settings
+  notification_interval: 60
+  notification_period: "24x7"
+  check_period: "24x7"
+
+
+snmp:
+  community: "public"                        # SNMP community string
+  version: "2c"                              # 1, 2c, or 3
+  port: 161
+  timeout: 10
+  retries: 3
+
+
+nrpe:
+  port: 5666
+  timeout: 30
+
+
+# =============================================================================
+# Maps configuration
+# =============================================================================
+maps:
+  output_dir: "/var/www/html/nagios-maps"    # Where to write HTML map files
+  refresh_interval: 60                       # Auto-refresh interval in seconds
+
+  # Nagios web interface base URL (for clickable links on the map)
+
+  # Map files to generate
+  device_map: "device-map.html"
+  vm_map: "vm-map.html"
+  phone_map: "phone-map.html"
+
+
+# =============================================================================
+# Logging
+# =============================================================================
+logging:
+  level: "INFO"                              # DEBUG, INFO, WARNING, ERROR
+  file: "/var/log/nautobot-nagios-sync.log"
+  max_bytes: 10485760                        # 10MB
+  backup_count: 5
