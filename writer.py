@@ -1,0 +1,231 @@
+"""
+writer.py — Writes Nagios .cfg files from transformed data.
+
+Creates 3 files:
+  - nautobot_hosts.cfg
+  - nautobot_services.cfg
+  - nautobot_hostgroups.cfg
+
+Writes locally to a temp dir, then SCPs to Nagios VM via paramiko.
+"""
+
+import logging
+import os
+import tempfile
+
+import paramiko
+import yaml
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Config loader
+# ---------------------------------------------------------------------------
+
+def load_config(path: str = "config.yaml") -> dict:
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
+
+
+# ---------------------------------------------------------------------------
+# SSH/SCP client
+# ---------------------------------------------------------------------------
+
+def _get_ssh_client() -> paramiko.SSHClient:
+    host     = os.getenv("NAGIOS_SSH_HOST")
+    user     = os.getenv("NAGIOS_SSH_USER")
+    password = os.getenv("NAGIOS_SSH_PASSWORD")
+    port     = int(os.getenv("NAGIOS_SSH_PORT", 22))
+
+    if not all([host, user, password]):
+        raise EnvironmentError("NAGIOS_SSH_HOST, NAGIOS_SSH_USER, NAGIOS_SSH_PASSWORD must be set in .env")
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(hostname=host, port=port, username=user, password=password)
+    logger.debug(f"SSH connected to {user}@{host}:{port}")
+    return client
+
+
+def _scp_file(sftp: paramiko.SFTPClient, local_path: str, remote_path: str):
+    """Upload a single file via SFTP."""
+    sftp.put(local_path, remote_path)
+    logger.debug(f"SCP: {local_path} → {remote_path}")
+
+
+# ---------------------------------------------------------------------------
+# Renderers
+# ---------------------------------------------------------------------------
+
+def _render_host(host: dict, config: dict) -> str:
+    nagios_cfg = config["nagios"]
+    lines = [
+        "define host {",
+        f"    use                     {nagios_cfg['host_template']}",
+        f"    host_name               {host['hostname']}",
+        f"    alias                   {host['display']}",
+        f"    address                 {host['address']}",
+        f"    check_interval          {nagios_cfg['check_interval']}",
+        f"    retry_interval          {nagios_cfg['retry_interval']}",
+        f"    max_check_attempts      {nagios_cfg['max_check_attempts']}",
+        f"    notification_interval   {nagios_cfg['notification_interval']}",
+        f"    notification_period     {nagios_cfg['notification_period']}",
+        f"    check_period            {nagios_cfg['check_period']}",
+        f"    ; nautobot_id={host['nautobot_id']} type={host['type']} role={host['role']} method={host['check_method']}",
+    ]
+    if host.get("comments"):
+        lines.append(f"    notes                   {host['comments']}")
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def _render_service(svc: dict, config: dict) -> str:
+    nagios_cfg = config["nagios"]
+    lines = [
+        "define service {",
+        f"    use                     {nagios_cfg['service_template']}",
+        f"    host_name               {svc['hostname']}",
+        f"    service_description     {svc['description']}",
+        f"    check_command           {svc['check']}",
+        f"    check_interval          {nagios_cfg['check_interval']}",
+        f"    retry_interval          {nagios_cfg['retry_interval']}",
+        f"    max_check_attempts      {nagios_cfg['max_check_attempts']}",
+        f"    notification_interval   {nagios_cfg['notification_interval']}",
+        f"    notification_period     {nagios_cfg['notification_period']}",
+        f"    check_period            {nagios_cfg['check_period']}",
+        "}",
+    ]
+    return "\n".join(lines)
+
+
+def _render_hostgroup(hg: dict) -> str:
+    members = ",".join(hg["members"])
+    lines = [
+        "define hostgroup {",
+        f"    hostgroup_name  {hg['name']}",
+        f"    alias           {hg['alias']}",
+        f"    members         {members}",
+        "}",
+    ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Atomic local write
+# ---------------------------------------------------------------------------
+
+def _write_local(path: str, content: str):
+    dir_name = os.path.dirname(path)
+    os.makedirs(dir_name, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.replace(tmp_path, path)
+    except Exception:
+        os.unlink(tmp_path)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Main write orchestrator
+# ---------------------------------------------------------------------------
+
+def write(result: dict, config: dict):
+    """
+    Writes all Nagios .cfg files from transformer result, then SCPs to Nagios VM.
+    """
+    remote_dir = config["nagios"]["config_dir"]
+    header = (
+        "# ============================================================\n"
+        "# AUTO-GENERATED by nautobot-nagios-sync\n"
+        "# DO NOT EDIT MANUALLY — changes will be overwritten on next sync\n"
+        "# ============================================================\n\n"
+    )
+
+    # Build file contents
+    files = {
+        "nautobot_hosts.cfg": _build_hosts_content(result, config, header),
+        "nautobot_services.cfg": _build_services_content(result, config, header),
+        "nautobot_hostgroups.cfg": _build_hostgroups_content(result, header),
+    }
+
+    # Write to local temp dir
+    with tempfile.TemporaryDirectory() as tmpdir:
+        local_files = {}
+        for fname, content in files.items():
+            local_path = os.path.join(tmpdir, fname)
+            _write_local(local_path, content)
+            local_files[fname] = local_path
+            logger.info(f"Written locally: {local_path} ({len(content)} bytes)")
+
+        # SCP to Nagios VM
+        logger.info("Connecting to Nagios VM via SSH...")
+        ssh = _get_ssh_client()
+        try:
+            sftp = ssh.open_sftp()
+
+            # Ensure remote dir exists
+            try:
+                sftp.stat(remote_dir)
+            except FileNotFoundError:
+                # mkdir -p via SSH
+                stdin, stdout, stderr = ssh.exec_command(f"sudo mkdir -p {remote_dir}")
+                stdout.channel.recv_exit_status()
+
+            for fname, local_path in local_files.items():
+                remote_path = f"{remote_dir}/{fname}"
+                _scp_file(sftp, local_path, remote_path)
+                logger.info(f"SCP: {fname} → {remote_path}")
+
+            sftp.close()
+        finally:
+            ssh.close()
+
+    logger.info("All files written and uploaded successfully.")
+
+
+def _build_hosts_content(result, config, header):
+    content = header
+    for host in result["hosts"]:
+        content += _render_host(host, config) + "\n\n"
+    return content
+
+
+def _build_services_content(result, config, header):
+    content = header
+    for svc in result["services"]:
+        content += _render_service(svc, config) + "\n\n"
+    return content
+
+
+def _build_hostgroups_content(result, header):
+    content = header
+    for hg in result["hostgroups"].values():
+        content += _render_hostgroup(hg) + "\n\n"
+    return content
+
+
+# ---------------------------------------------------------------------------
+# CLI test
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    from dotenv import load_dotenv
+    from fetcher import fetch_all, load_config
+    from transformer import transform
+
+    load_dotenv()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    cfg    = load_config()
+    data   = fetch_all(cfg)
+    result = transform(data, cfg)
+    write(result, cfg)
+
+    print("\n=== DONE ===")
+    print(f"Files uploaded to {cfg['nagios']['config_dir']} on Nagios VM")

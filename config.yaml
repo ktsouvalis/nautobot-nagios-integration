@@ -46,16 +46,16 @@ nautobot:
 
 nagios:
   # Path to Nagios config directory (where generated .cfg files will be written)
-  config_dir: "/etc/nagios/conf.d/nautobot"
+  config_dir: "/usr/local/nagios/etc/conf.d/nautobot"
 
   # Path to Nagios status.dat (for live map data)
-  status_dat: "/var/cache/nagios3/status.dat"
+  status_dat: "/usr/local/nagios/var/status.dat"
 
   # Path to nagios binary (for config validation)
-  nagios_bin: "/usr/sbin/nagios"
+  nagios_bin: "/usr/local/nagios/bin/nagios"
 
   # Path to nagios main config (for validation)
-  nagios_cfg: "/etc/nagios3/nagios.cfg"
+  nagios_cfg: "/usr/local/nagios/etc/nagios.cfg"
 
   # Command to reload Nagios after config update
   reload_command: "systemctl reload nagios"
