@@ -176,7 +176,7 @@ def _build_services(host: dict, config: dict) -> list:
         "description": "Host Reachability",
     })
 
-    if host["check_method"] == "snmp":
+    if host["check_method"] == "snmp" and host["type"] != "vm":
         services += [
             {
                 "hostname":    hostname,
@@ -216,6 +216,57 @@ def _build_services(host: dict, config: dict) -> list:
 
     return services
 
+def _build_interface_services(host: dict, data: dict, config: dict) -> list:
+    """Build SNMP interface services for SNMP-capable devices with ifIndex map."""
+    if host["check_method"] != "snmp" or host["type"] != "device":
+        return []
+
+    device_id = host["nautobot_id"]
+    ifindex_map = data.get("_ifindex_map", {}).get(device_id)
+    if not ifindex_map:
+        return []
+
+    cisco_roles = config["snmp"].get("cisco_roles", [])
+    community = (
+        os.getenv("SNMP_COMMUNITY_CISCO", "public")
+        if any(r in host["role"] for r in cisco_roles)
+        else os.getenv("SNMP_COMMUNITY_DEFAULT", "public")
+    )
+    version = config["snmp"].get("version", "2c")
+    hostname = host["hostname"]
+    services = []
+
+    interfaces = data.get("_interfaces_by_device", {}).get(device_id, [])
+    for iface in interfaces:
+        ifname = iface.get("name", "")
+        ifindex = ifindex_map.get(ifname)
+        if ifindex is None:
+            continue
+
+        safe_name = ifname.replace("/", "-").replace(" ", "_")
+
+        services += [
+            {
+                "hostname":    hostname,
+                "service":     f"IFACE-{safe_name}-STATUS",
+                "check":       f"check_snmp!-C {community} -v {version} -o .1.3.6.1.2.1.2.2.1.8.{ifindex} -w 1:1 -c 1:1",
+                "description": f"Interface {ifname} Status",
+            },
+            {
+                "hostname":    hostname,
+                "service":     f"IFACE-{safe_name}-IN",
+                "check":       f"check_snmp!-C {community} -v {version} -o .1.3.6.1.2.1.2.2.1.10.{ifindex}",
+                "description": f"Interface {ifname} In Octets",
+            },
+            {
+                "hostname":    hostname,
+                "service":     f"IFACE-{safe_name}-OUT",
+                "check":       f"check_snmp!-C {community} -v {version} -o .1.3.6.1.2.1.2.2.1.16.{ifindex}",
+                "description": f"Interface {ifname} Out Octets",
+            },
+        ]
+
+    return services
 
 # ---------------------------------------------------------------------------
 # Hostgroup builder
@@ -296,6 +347,7 @@ def transform(data: dict, config: dict) -> dict:
         if host:
             hosts.append(host)
             services.extend(_build_services(host, config))
+            services.extend(_build_interface_services(host, data, config))
 
     # --- VMs ---
     for vm in data["vms"]:

@@ -19,6 +19,7 @@ import tempfile
 import paramiko
 import yaml
 from dotenv import load_dotenv
+from utils import shorten_ifname
 
 load_dotenv()
 
@@ -140,12 +141,39 @@ def _build_network_graph(result: dict, data: dict, config: dict) -> tuple[list, 
         if id_a is None or id_b is None:
             continue
 
+        iface_a = next((i for i in data.get("interfaces", []) if i["id"] == iface_id_a), {})
+        iface_b = next((i for i in data.get("interfaces", []) if i["id"] == iface_id_b), {})
+        ifname_a = iface_a.get("name", "?")
+        ifname_b = iface_b.get("name", "?")
+        short_a  = shorten_ifname(ifname_a)
+        short_b  = shorten_ifname(ifname_b)
+        safe_a   = ifname_a.replace("/", "-").replace(" ", "_")
+        safe_b   = ifname_b.replace("/", "-").replace(" ", "_")
+        svc_a     = f"Interface {ifname_a} Status"    if iface_a.get("name") else None
+        svc_b     = f"Interface {ifname_b} Status"    if iface_b.get("name") else None
+        svc_a_in  = f"Interface {ifname_a} In Octets" if iface_a.get("name") else None
+        svc_a_out = f"Interface {ifname_a} Out Octets" if iface_a.get("name") else None
+        svc_b_in  = f"Interface {ifname_b} In Octets" if iface_b.get("name") else None
+        svc_b_out = f"Interface {ifname_b} Out Octets" if iface_b.get("name") else None
+
         edges.append({
-            "from":  id_a,
-            "to":    id_b,
-            "title": f"{hostname_a} ↔ {hostname_b}",
-            "color": {"color": "#7f8c8d"},
-            "width": 2,
+            "from":      id_a,
+            "to":        id_b,
+            "title":     f"{hostname_a}:{ifname_a} ↔ {hostname_b}:{ifname_b}",
+            "label":     f"{short_a} ↔ {short_b}",
+            "font":      {"size": 9, "color": "#aaa", "align": "middle"},
+            "color":     {"color": "#7f8c8d"},
+            "width":     2,
+            "svc_a":     svc_a,
+            "svc_b":     svc_b,
+            "svc_a_in":  svc_a_in,
+            "svc_a_out": svc_a_out,
+            "svc_b_in":  svc_b_in,
+            "svc_b_out": svc_b_out,
+            "host_a":    hostname_a,
+            "host_b":    hostname_b,
+            "ifname_a":  ifname_a,
+            "ifname_b":  ifname_b,
         })
 
     return nodes, edges
@@ -497,36 +525,74 @@ const HOST_STATE_COLORS = {{
 
 async function refreshStatus() {{
   try {{
-    const url = `${{NAGIOS_URL}}/cgi-bin/statusjson.cgi?query=hostlist&details=true`;
-    const resp = await fetch(url, {{ credentials: "include" }});
-    if (!resp.ok) throw new Error(`HTTP ${{resp.status}}`);
-    const data = await resp.json();
+    const svcUrl  = `${{NAGIOS_URL}}/cgi-bin/statusjson.cgi?query=servicelist&details=true&hostname=all`;
+    const hostUrl = `${{NAGIOS_URL}}/cgi-bin/statusjson.cgi?query=hostlist&details=true`;
+    const [svcResp, hostResp] = await Promise.all([
+      fetch(svcUrl,  {{ credentials: "include" }}),
+      fetch(hostUrl, {{ credentials: "include" }}),
+    ]);
+    if (!svcResp.ok || !hostResp.ok) throw new Error(`HTTP error`);
+    const svcData  = await svcResp.json();
+    const hostData = await hostResp.json();
 
-    const hostlist = data.data?.hostlist || {{}};
-    const updates = [];
+    const hostlist = hostData.data?.hostlist || {{}};
+    const svclist  = svcData.data?.servicelist || {{}};
+    const updates  = [];
     let up = 0, down = 0, unknown = 0;
 
     nodes.getIds().forEach(id => {{
       const node = nodes.get(id);
-      const hostData = hostlist[node.hostname];
-      if (hostData) {{
-        const state = hostData.status;
+      const h    = hostlist[node.hostname];
+      if (h) {{
+        const state = h.status;
         const color = HOST_STATE_COLORS[state] || "#95a5a6";
+        const label = {{1:'PENDING',2:'UP',4:'DOWN',8:'UNREACHABLE'}}[state] || 'UNKNOWN';
         updates.push({{
           id,
           color: {{ background: color, border: color }},
-          title: `${{node.hostname}}\\n${{node.role}} | ${{node.address}}\\nState: ${{{{1:'PENDING',2:'UP',4:'DOWN',8:'UNREACHABLE'}}[state] || 'UNKNOWN'}}\\n${{hostData.plugin_output || ""}}`,
+          title: `${{node.hostname}}\n${{node.role}} | ${{node.address}}\nState: ${{label}}\n${{h.plugin_output || ""}}`,
         }});
         if (state === 2) up++;
         else if (state === 4 || state === 8) down++;
-        else unknown++;  // PENDING or UNREACHABLE
+        else unknown++;
       }} else {{
         updates.push({{ id, color: {{ background: "#95a5a6", border: "#95a5a6" }} }});
         unknown++;
       }}
     }});
-
     nodes.update(updates);
+
+    // Color edges based on interface STATUS, show RX/TX in tooltip
+    const edgeUpdates = [];
+    edges.getIds().forEach(id => {{
+      const edge = edges.get(id);
+      if (!edge.svc_a && !edge.svc_b) return;
+      const states = [];
+      if (edge.svc_a && svclist[edge.host_a]?.[edge.svc_a] !== undefined)
+        states.push(svclist[edge.host_a][edge.svc_a].status);
+      if (edge.svc_b && svclist[edge.host_b]?.[edge.svc_b] !== undefined)
+        states.push(svclist[edge.host_b][edge.svc_b].status);
+      let color;
+      if      (states.length === 0)        color = "#95a5a6";
+      else if (states.some(s => s === 16)) color = "#e74c3c";
+      else if (states.some(s => s === 4))  color = "#f39c12";
+      else if (states.every(s => s === 1)) color = "#2ecc71";
+      else                                 color = "#95a5a6";
+
+      // Build RX/TX tooltip
+      const rxA = svclist[edge.host_a]?.[edge.svc_a_in]?.plugin_output  || "";
+      const txA = svclist[edge.host_a]?.[edge.svc_a_out]?.plugin_output || "";
+      const rxB = svclist[edge.host_b]?.[edge.svc_b_in]?.plugin_output  || "";
+      const txB = svclist[edge.host_b]?.[edge.svc_b_out]?.plugin_output || "";
+      const tip = `${{edge.host_a}}:${{edge.ifname_a}} ↔ ${{edge.host_b}}:${{edge.ifname_b}}`
+        + (rxA ? `\n← RX: ${{rxA}}` : "")
+        + (txA ? `\n→ TX: ${{txA}}` : "")
+        + (rxB ? `\n← RX: ${{rxB}}` : "")
+        + (txB ? `\n→ TX: ${{txB}}` : "");
+
+      edgeUpdates.push({{ id, color: {{ color, highlight: color }}, title: tip }});
+    }});
+    edges.update(edgeUpdates);
 
     document.getElementById("host-counts").innerHTML =
       `<span class="up">▲ ${{up}} UP</span> &nbsp;

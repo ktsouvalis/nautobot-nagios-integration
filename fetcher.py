@@ -188,27 +188,7 @@ def fetch_clusters(client: NautobotClient) -> list:
 # SNMP ifIndex map builder
 # ---------------------------------------------------------------------------
 
-# Cisco interface name abbreviations (Nautobot full name → SNMP ifName)
-CISCO_IF_ABBREV = {
-    "GigabitEthernet":      "Gi",
-    "FastEthernet":         "Fa",
-    "TenGigabitEthernet":   "Te",
-    "TwentyFiveGigE":       "Twe",
-    "FortyGigabitEthernet": "Fo",
-    "HundredGigE":          "Hu",
-    "Ethernet":             "Et",
-    "Loopback":             "Lo",
-    "Vlan":                 "Vl",
-    "Port-channel":         "Po",
-}
-
-
-def _normalize_ifname(name: str) -> str:
-    """Normalize Nautobot interface name to SNMP ifName format."""
-    for full, abbrev in CISCO_IF_ABBREV.items():
-        if name.startswith(full):
-            return abbrev + name[len(full):]
-    return name  # MikroTik, etc. — use as-is
+from utils import normalize_ifname as _normalize_ifname
 
 
 def _walk_ifnames_ssh(ip: str, community: str, timeout: int = 10) -> dict:
@@ -227,7 +207,7 @@ def _walk_ifnames_ssh(ip: str, community: str, timeout: int = 10) -> dict:
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(hostname=ssh_host, port=ssh_port, username=ssh_user,
                        password=ssh_password, timeout=timeout)
-        cmd = f"snmpwalk -v2c -c '{community}' -t {timeout} -r 1 {ip} {ifname_oid}"
+        cmd = f'snmpwalk -v2c -c "{community}" -t {timeout} -r 1 {ip} {ifname_oid}'
         _, stdout, stderr = client.exec_command(cmd)
         output = stdout.read().decode()
         client.close()
