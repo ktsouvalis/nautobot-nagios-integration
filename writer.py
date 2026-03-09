@@ -75,6 +75,7 @@ def _render_host(host: dict, config: dict) -> str:
         f"    notification_interval   {nagios_cfg['notification_interval']}",
         f"    notification_period     {nagios_cfg['notification_period']}",
         f"    check_period            {nagios_cfg['check_period']}",
+        f"    check_command           check-host-alive",
         f"    contact_groups          admins",
         f"    ; nautobot_id={host['nautobot_id']} type={host['type']} role={host['role']} method={host['check_method']}",
     ]
