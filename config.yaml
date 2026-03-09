@@ -33,7 +33,6 @@ nautobot:
   # Device roles that are IP phones (ping only)
   phone_roles:
     - "ip-phone"
-    - "voip-phone"
 
   # VM platform names that use NRPE
   vm_nrpe_platforms:
@@ -92,16 +91,33 @@ nrpe:
 # Maps configuration
 # =============================================================================
 maps:
-  output_dir: "/var/www/html/nagios-maps"    # Where to write HTML map files
+  output_dir: "/usr/local/nagios/share/maps"    # Where to write HTML map files
   refresh_interval: 60                       # Auto-refresh interval in seconds
 
   # Nagios web interface base URL (for clickable links on the map)
 
   # Map files to generate
-  device_map: "device-map.html"
+  network_map: "network-map.html"
   vm_map: "vm-map.html"
   phone_map: "phone-map.html"
+  hosts_map: "hosts-map.html"
 
+# Roles per map
+  network_roles:
+    - "switch"
+    - "router"
+    - "firewall"
+    - "access-point"
+    - "san"
+  hosts_roles:
+    - "nas"
+    - "ups"
+    - "server"
+    - "kvm"
+    - "raspberry-pi"
+    - "camera"
+  phone_roles:
+    - "ip-phone"
 
 # =============================================================================
 # Logging
