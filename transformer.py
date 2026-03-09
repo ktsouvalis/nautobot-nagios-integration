@@ -246,10 +246,12 @@ def _build_hostgroups(hosts: list) -> dict:
             _add(f"role-{role}", f"Role: {role.title()}", hostname)
 
         # Group by location (devices)
-        location = host.get("location")
-        if location and location != "unknown":
-            loc_slug = location.lower().replace(" ", "-")
-            _add(f"location-{loc_slug}", f"Location: {location}", hostname)
+        location_names = set(h.get("location") for h in hosts if h.get("type") == "device" and h.get("location") and h.get("location") != "unknown")
+        if len(location_names) > 1:
+            location = host.get("location")
+            if location and location != "unknown":
+                loc_slug = location.lower().replace(" ", "-")
+                _add(f"location-{loc_slug}", f"Location: {location}", hostname)
 
         # Group by cluster (VMs)
         cluster_names = set(h.get("cluster") for h in hosts if h.get("type") == "vm" and h.get("cluster") and h.get("cluster") != "unknown")
