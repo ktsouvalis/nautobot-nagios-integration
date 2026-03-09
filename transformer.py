@@ -252,10 +252,12 @@ def _build_hostgroups(hosts: list) -> dict:
             _add(f"location-{loc_slug}", f"Location: {location}", hostname)
 
         # Group by cluster (VMs)
-        cluster = host.get("cluster")
-        if cluster and cluster != "unknown":
-            cluster_slug = cluster.lower().replace(" ", "-")
-            _add(f"cluster-{cluster_slug}", f"Cluster: {cluster}", hostname)
+        cluster_names = set(h.get("cluster") for h in hosts if h.get("type") == "vm" and h.get("cluster") and h.get("cluster") != "unknown")
+        if len(cluster_names) > 1:
+            cluster = host.get("cluster")
+            if cluster and cluster != "unknown":
+                cluster_slug = cluster.lower().replace(" ", "-")
+                _add(f"cluster-{cluster_slug}", f"Cluster: {cluster}", hostname)
 
         # Phone group
         role_slug = host.get("role", "")
