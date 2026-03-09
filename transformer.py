@@ -184,7 +184,7 @@ def _build_services(host: dict, config: dict) -> list:
                 "hostname":    hostname,
                 "service":     "SNMP-CPU",
                 "check":       f"check_snmp!-C {snmp_community} -v {snmp_version} -o .1.3.6.1.4.1.9.2.1.58.0 -w 80 -c 90",
-                "description": "SNMP CPU Load (Cisco)",
+                "description": "SNMP CPU Load Cisco",
             },
         ]
 
@@ -194,19 +194,19 @@ def _build_services(host: dict, config: dict) -> list:
                 "hostname":    hostname,
                 "service":     "NRPE-CPU",
                 "check":       f"check_nrpe!-H {host['address']} -p {nrpe_port} -c check_load",
-                "description": "CPU Load (NRPE)",
+                "description": "CPU Load NRPE",
             },
             {
                 "hostname":    hostname,
                 "service":     "NRPE-DISK",
                 "check":       f"check_nrpe!-H {host['address']} -p {nrpe_port} -c check_disk",
-                "description": "Disk Usage (NRPE)",
+                "description": "Disk Usage NRPE",
             },
             {
                 "hostname":    hostname,
                 "service":     "NRPE-MEMORY",
                 "check":       f"check_nrpe!-H {host['address']} -p {nrpe_port} -c check_mem",
-                "description": "Memory Usage (NRPE)",
+                "description": "Memory Usage NRPE",
             },
         ]
 
