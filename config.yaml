@@ -75,11 +75,13 @@ nagios:
 
 
 snmp:
-  community: "public"                        # SNMP community string
-  version: "2c"                              # 1, 2c, or 3
+  version: "2c"
   port: 161
   timeout: 10
   retries: 3
+  cisco_roles:
+    - "switch"
+    - "san"
 
 
 nrpe:

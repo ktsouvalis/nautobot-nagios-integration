@@ -10,6 +10,7 @@ Loads secrets from .env, config from config.yaml.
 import logging
 import os
 
+import paramiko
 import requests
 import yaml
 from dotenv import load_dotenv
@@ -184,6 +185,122 @@ def fetch_clusters(client: NautobotClient) -> list:
 
 
 # ---------------------------------------------------------------------------
+# SNMP ifIndex map builder
+# ---------------------------------------------------------------------------
+
+# Cisco interface name abbreviations (Nautobot full name → SNMP ifName)
+CISCO_IF_ABBREV = {
+    "GigabitEthernet":      "Gi",
+    "FastEthernet":         "Fa",
+    "TenGigabitEthernet":   "Te",
+    "TwentyFiveGigE":       "Twe",
+    "FortyGigabitEthernet": "Fo",
+    "HundredGigE":          "Hu",
+    "Ethernet":             "Et",
+    "Loopback":             "Lo",
+    "Vlan":                 "Vl",
+    "Port-channel":         "Po",
+}
+
+
+def _normalize_ifname(name: str) -> str:
+    """Normalize Nautobot interface name to SNMP ifName format."""
+    for full, abbrev in CISCO_IF_ABBREV.items():
+        if name.startswith(full):
+            return abbrev + name[len(full):]
+    return name  # MikroTik, etc. — use as-is
+
+
+def _walk_ifnames_ssh(ip: str, community: str, timeout: int = 10) -> dict:
+    """
+    Run snmpwalk via SSH on the Nagios VM to get ifName -> ifIndex mapping.
+    Returns { ifname: ifindex }. Silently returns empty dict on failure.
+    """
+    result = {}
+    ifname_oid = "1.3.6.1.2.1.31.1.1.1.1"
+    ssh_host     = os.getenv("NAGIOS_SSH_HOST")
+    ssh_user     = os.getenv("NAGIOS_SSH_USER")
+    ssh_password = os.getenv("NAGIOS_SSH_PASSWORD")
+    ssh_port     = int(os.getenv("NAGIOS_SSH_PORT", 22))
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(hostname=ssh_host, port=ssh_port, username=ssh_user,
+                       password=ssh_password, timeout=timeout)
+        cmd = f"snmpwalk -v2c -c '{community}' -t {timeout} -r 1 {ip} {ifname_oid}"
+        _, stdout, stderr = client.exec_command(cmd)
+        output = stdout.read().decode()
+        client.close()
+        for line in output.splitlines():
+            if "STRING:" not in line:
+                continue
+            parts = line.split("=")
+            if len(parts) != 2:
+                continue
+            oid_part   = parts[0].strip()
+            value_part = parts[1].strip()
+            ifindex    = int(oid_part.split(".")[-1])
+            ifname     = value_part.replace("STRING:", "").strip().strip('"')
+            result[ifname] = ifindex
+    except Exception as e:
+        logger.debug(f"SSH snmpwalk failed for {ip}: {e}")
+    return result
+
+
+def fetch_ifindex_map(devices: list, ips_by_id: dict, roles_by_id: dict, config: dict) -> dict:
+    """
+    For each SNMP-capable device, walk ifName via SSH snmpwalk and build:
+      { device_id: { normalized_nautobot_ifname: ifindex } }
+    Silently skips devices that don't respond.
+    """
+    snmp_roles        = [r.lower() for r in config["nautobot"].get("snmp_roles", [])]
+    cisco_roles       = [r.lower() for r in config["snmp"].get("cisco_roles", [])]
+    community_cisco   = os.getenv("SNMP_COMMUNITY_CISCO", "public")
+    community_default = os.getenv("SNMP_COMMUNITY_DEFAULT", "public")
+    timeout           = config["snmp"].get("timeout", 10)
+
+    result  = {}
+    targets = []
+
+    for device in devices:
+        role_obj = device.get("role", {})
+        role_id  = role_obj.get("id") if role_obj else None
+        role     = roles_by_id.get(role_id, {}).get("name", "").lower().replace(" ", "-") if role_id else ""
+
+        if not any(r in role for r in snmp_roles):
+            continue
+
+        ip_obj = device.get("primary_ip4") or device.get("primary_ip6")
+        if not ip_obj:
+            continue
+
+        ip_id  = ip_obj.get("id")
+        ip_rec = ips_by_id.get(ip_id, {})
+        ip     = ip_rec.get("address", "").split("/")[0]
+        if not ip:
+            continue
+
+        community = community_cisco if any(r in role for r in cisco_roles) else community_default
+        targets.append((device["id"], ip, community))
+
+    for dev_id, ip, community in targets:
+        logger.info(f"SNMP ifName walk (via SSH): {ip}")
+        raw = _walk_ifnames_ssh(ip, community, timeout)
+        if raw:
+            normalized = {}
+            for ifname, ifindex in raw.items():
+                normalized[ifname] = ifindex                    # raw (MikroTik: ether1)
+                normalized[_normalize_ifname(ifname)] = ifindex # normalized (Cisco: Gi1/0/1)
+            result[dev_id] = normalized
+            logger.info(f"  → {len(raw)} interfaces indexed")
+        else:
+            logger.warning(f"  → No SNMP response from {ip}, skipping")
+
+    return result
+
+
+
+# ---------------------------------------------------------------------------
 # Main fetch orchestrator — returns all data in one dict
 # ---------------------------------------------------------------------------
 
@@ -229,6 +346,16 @@ def fetch_all(config: dict) -> dict:
         vm_id = iface.get("virtual_machine", {}).get("id")
         if vm_id:
             data["_vm_interfaces_by_vm"].setdefault(vm_id, []).append(iface)
+
+    # Build SNMP ifIndex map: { device_id: { ifname: ifindex } }
+    logger.info("Building SNMP ifIndex map for network devices...")
+    data["_ifindex_map"] = fetch_ifindex_map(
+        data["devices"],
+        data["_ips_by_id"],
+        data["_roles_by_id"],
+        config,
+    )
+    logger.info(f"ifIndex map built for {len(data['_ifindex_map'])} devices")
 
     logger.info("Nautobot data fetch complete.")
     _log_summary(data)

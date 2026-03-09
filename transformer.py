@@ -160,7 +160,11 @@ def _build_services(host: dict, config: dict) -> list:
     """Build Nagios service dicts for a host based on its check_method."""
     services = []
     hostname = host["hostname"]
-    snmp_community = os.getenv("SNMP_COMMUNITY", "public")
+    cisco_roles = config["snmp"].get("cisco_roles", [])
+    if any(r in host["role"] for r in cisco_roles):
+        snmp_community = os.getenv("SNMP_COMMUNITY_CISCO", "public")
+    else:
+        snmp_community = os.getenv("SNMP_COMMUNITY_DEFAULT", "public")
     snmp_version   = config["snmp"].get("version", "2c")
     nrpe_port      = config["nrpe"].get("port", 5666)
 
