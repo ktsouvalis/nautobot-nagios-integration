@@ -452,7 +452,6 @@ def _render_html(title: str, nodes: list, edges: list, nagios_url: str, refresh_
 <div id="legend">
   <div class="legend-item"><div class="legend-dot" style="background:#2ecc71"></div> UP / OK</div>
   <div class="legend-item"><div class="legend-dot" style="background:#e74c3c"></div> DOWN / CRITICAL</div>
-  <div class="legend-item"><div class="legend-dot" style="background:#f39c12"></div> WARNING</div>
   <div class="legend-item"><div class="legend-dot" style="background:#95a5a6"></div> PENDING / UNKNOWN</div>
   <div class="legend-item"><div class="legend-dot" style="background:#e67e22"></div> UNREACHABLE</div>
 </div>
@@ -527,16 +526,26 @@ async function refreshStatus() {{
   try {{
     const svcUrl  = `${{NAGIOS_URL}}/cgi-bin/statusjson.cgi?query=servicelist&details=true&hostname=all`;
     const hostUrl = `${{NAGIOS_URL}}/cgi-bin/statusjson.cgi?query=hostlist&details=true`;
-    const [svcResp, hostResp] = await Promise.all([
-      fetch(svcUrl,  {{ credentials: "include" }}),
-      fetch(hostUrl, {{ credentials: "include" }}),
-    ]);
-    if (!svcResp.ok || !hostResp.ok) throw new Error(`HTTP error`);
-    const svcData  = await svcResp.json();
+    const hostResp = await fetch(hostUrl, {{ credentials: "include" }});
+    if (!hostResp.ok) throw new Error(`HTTP error`);
     const hostData = await hostResp.json();
-
     const hostlist = hostData.data?.hostlist || {{}};
-    const svclist  = svcData.data?.servicelist || {{}};
+
+    // Collect unique hostnames from edges
+    const edgeHosts = new Set();
+    edges.getIds().forEach(id => {{
+      const e = edges.get(id);
+      if (e.host_a) edgeHosts.add(e.host_a);
+      if (e.host_b) edgeHosts.add(e.host_b);
+    }});
+
+    // Fetch servicelist per host and merge
+    const svclist = {{}};
+    await Promise.all([...edgeHosts].map(async hn => {{
+      const r = await fetch(`${{NAGIOS_URL}}/cgi-bin/statusjson.cgi?query=servicelist&details=true&hostname=${{hn}}`, {{ credentials: "include" }});
+      const d = await r.json();
+      Object.assign(svclist, d.data?.servicelist || {{}});
+    }}));
     const updates  = [];
     let up = 0, down = 0, unknown = 0;
 
@@ -580,10 +589,10 @@ async function refreshStatus() {{
       else                                 color = "#95a5a6";
 
       // Build RX/TX tooltip
-      const rxA = svclist[edge.host_a]?.[edge.svc_a_in]?.plugin_output  || "";
-      const txA = svclist[edge.host_a]?.[edge.svc_a_out]?.plugin_output || "";
-      const rxB = svclist[edge.host_b]?.[edge.svc_b_in]?.plugin_output  || "";
-      const txB = svclist[edge.host_b]?.[edge.svc_b_out]?.plugin_output || "";
+      const rxA = svclist[edge.host_a]?.[edge.svc_a_in]?.long_plugin_output  || "";
+      const txA = svclist[edge.host_a]?.[edge.svc_a_out]?.long_plugin_output || "";
+      const rxB = svclist[edge.host_b]?.[edge.svc_b_in]?.long_plugin_output  || "";
+      const txB = svclist[edge.host_b]?.[edge.svc_b_out]?.long_plugin_output || "";
       const tip = `${{edge.host_a}}:${{edge.ifname_a}} ↔ ${{edge.host_b}}:${{edge.ifname_b}}`
         + (rxA ? `\n← RX: ${{rxA}}` : "")
         + (txA ? `\n→ TX: ${{txA}}` : "")

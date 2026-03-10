@@ -11,6 +11,7 @@ Uses field names confirmed from live Nautobot 2.x API output.
 
 import logging
 import os
+from utils import normalize_ifname
 
 logger = logging.getLogger(__name__)
 
@@ -239,7 +240,7 @@ def _build_interface_services(host: dict, data: dict, config: dict) -> list:
     interfaces = data.get("_interfaces_by_device", {}).get(device_id, [])
     for iface in interfaces:
         ifname = iface.get("name", "")
-        ifindex = ifindex_map.get(ifname)
+        ifindex = ifindex_map.get(ifname) or ifindex_map.get(normalize_ifname(ifname))
         if ifindex is None:
             continue
 
