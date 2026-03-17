@@ -522,6 +522,7 @@ const HOST_STATE_COLORS = {{
   8: "#e67e22",   // UNREACHABLE
 }};
 
+const prevOctets = {{}};  // {{ edgeId: {{ rxA, txA, ts }} }}
 async function refreshStatus() {{
   try {{
     const svcUrl  = `${{NAGIOS_URL}}/cgi-bin/statusjson.cgi?query=servicelist&details=true&hostname=all`;
@@ -588,16 +589,37 @@ async function refreshStatus() {{
       else if (states.every(s => s === 1)) color = "#2ecc71";
       else                                 color = "#95a5a6";
 
-      // Build RX/TX tooltip
-      const rxA = svclist[edge.host_a]?.[edge.svc_a_in]?.long_plugin_output  || "";
-      const txA = svclist[edge.host_a]?.[edge.svc_a_out]?.long_plugin_output || "";
-      const rxB = svclist[edge.host_b]?.[edge.svc_b_in]?.long_plugin_output  || "";
-      const txB = svclist[edge.host_b]?.[edge.svc_b_out]?.long_plugin_output || "";
+      // Build RX/TX tooltip with throughput
+      const now = Date.now() / 1000;
+      const fmtSpeed = bps => {{
+        if (bps === null) return '...';
+        if (bps < 1000) return bps.toFixed(1) + ' KB/s';
+        if (bps < 1000000) return (bps/1000).toFixed(1) + ' MB/s';
+        return (bps/1000000).toFixed(1) + ' GB/s';
+      }};
+      const getRaw = (host, svc) => {{
+        const s = svclist[host]?.[svc]?.long_plugin_output || '';
+        const m = s.match(/SNMP OK - (\d+)/);
+        return m ? parseInt(m[1]) : null;
+      }};
+
+      const rxARaw = getRaw(edge.host_a, edge.svc_a_in);
+      const txARaw = getRaw(edge.host_a, edge.svc_a_out);
+      const prev   = prevOctets[id];
+      let rxSpeed = null, txSpeed = null;
+      if (prev && rxARaw !== null && txARaw !== null) {{
+        const dt = now - prev.ts;
+        if (dt > 0) {{
+          rxSpeed = (rxARaw - prev.rxA) / dt;
+          txSpeed = (txARaw - prev.txA) / dt;
+        }}
+      }}
+      if (rxARaw !== null && txARaw !== null)
+        prevOctets[id] = {{ rxA: rxARaw, txA: txARaw, ts: now }};
+
       const tip = `${{edge.host_a}}:${{edge.ifname_a}} ↔ ${{edge.host_b}}:${{edge.ifname_b}}`
-        + (rxA ? `\n← RX: ${{rxA}}` : "")
-        + (txA ? `\n→ TX: ${{txA}}` : "")
-        + (rxB ? `\n← RX: ${{rxB}}` : "")
-        + (txB ? `\n→ TX: ${{txB}}` : "");
+        + `\n↓ RX: ${{fmtSpeed(rxSpeed)}}`
+        + `\n↑ TX: ${{fmtSpeed(txSpeed)}}`;
 
       edgeUpdates.push({{ id, color: {{ color, highlight: color }}, title: tip }});
     }});
