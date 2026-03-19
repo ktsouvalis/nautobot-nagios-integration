@@ -10,7 +10,6 @@ Loads secrets from .env, config from config.yaml.
 import logging
 import os
 
-import paramiko
 import requests
 import yaml
 from dotenv import load_dotenv
@@ -129,7 +128,8 @@ def fetch_interfaces(client: NautobotClient, config: dict) -> list:
     a cable attached (i.e. connected to another device).
     """
     params = {}
-    params["connected"] = "true"
+    if config["nautobot"].get("interfaces_connected_only", True):
+        params["connected"] = "true"
     interfaces = client._get("dcim/interfaces", params)
     logger.info(f"Fetched {len(interfaces)} interfaces (connected only: {config['nautobot'].get('interfaces_connected_only', True)})")
     return interfaces
@@ -191,26 +191,22 @@ def fetch_clusters(client: NautobotClient) -> list:
 from utils import normalize_ifname as _normalize_ifname
 
 
-def _walk_ifnames_ssh(ip: str, community: str, timeout: int = 10) -> dict:
+def _walk_ifnames_ssh(ip: str, community: str, timeout: int = 10, retries: int = 1) -> dict:
     """
     Run snmpwalk via SSH on the Nagios VM to get ifName -> ifIndex mapping.
     Returns { ifname: ifindex }. Silently returns empty dict on failure.
     """
+    from utils import get_ssh_client
     result = {}
     ifname_oid = "1.3.6.1.2.1.31.1.1.1.1"
-    ssh_host     = os.getenv("NAGIOS_SSH_HOST")
-    ssh_user     = os.getenv("NAGIOS_SSH_USER")
-    ssh_password = os.getenv("NAGIOS_SSH_PASSWORD")
-    ssh_port     = int(os.getenv("NAGIOS_SSH_PORT", 22))
     try:
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(hostname=ssh_host, port=ssh_port, username=ssh_user,
-                       password=ssh_password, timeout=timeout)
-        cmd = f'snmpwalk -v2c -c "{community}" -t {timeout} -r 1 {ip} {ifname_oid}'
-        _, stdout, stderr = client.exec_command(cmd)
-        output = stdout.read().decode()
-        client.close()
+        client = get_ssh_client(timeout=timeout)
+        try:
+            cmd = f'snmpwalk -v2c -c "{community}" -t {timeout} -r {retries} {ip} {ifname_oid}'
+            _, stdout, _ = client.exec_command(cmd)
+            output = stdout.read().decode()
+        finally:
+            client.close()
         for line in output.splitlines():
             if "STRING:" not in line:
                 continue
@@ -238,6 +234,7 @@ def fetch_ifindex_map(devices: list, ips_by_id: dict, roles_by_id: dict, config:
     community_cisco   = os.getenv("SNMP_COMMUNITY_CISCO", "public")
     community_default = os.getenv("SNMP_COMMUNITY_DEFAULT", "public")
     timeout           = config["snmp"].get("timeout", 10)
+    retries           = config["snmp"].get("retries", 1)
 
     result  = {}
     targets = []
@@ -265,7 +262,7 @@ def fetch_ifindex_map(devices: list, ips_by_id: dict, roles_by_id: dict, config:
 
     for dev_id, ip, community in targets:
         logger.info(f"SNMP ifName walk (via SSH): {ip}")
-        raw = _walk_ifnames_ssh(ip, community, timeout)
+        raw = _walk_ifnames_ssh(ip, community, timeout, retries)
         if raw:
             normalized = {}
             for ifname, ifindex in raw.items():
