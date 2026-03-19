@@ -167,7 +167,6 @@ def _build_services(host: dict, config: dict) -> list:
     else:
         snmp_community = os.getenv("SNMP_COMMUNITY_DEFAULT", "public")
     snmp_version   = config["snmp"].get("version", "2c")
-    nrpe_port      = config["nrpe"].get("port", 5666)
 
     # Every host gets a ping check
     services.append({
@@ -178,39 +177,44 @@ def _build_services(host: dict, config: dict) -> list:
     })
 
     if host["check_method"] == "snmp" and host["type"] != "vm":
-        services += [
+        snmp_services = [
             {
                 "hostname":    hostname,
                 "service":     "SNMP-UPTIME",
                 "check":       f"check_snmp!-C {snmp_community} -v {snmp_version} -o .1.3.6.1.2.1.1.3.0",
                 "description": "SNMP Uptime",
             },
-            {
+        ]
+        # Cisco-specific CPU OID — only for cisco_roles
+        if any(r in host["role"] for r in cisco_roles):
+            snmp_services.append({
                 "hostname":    hostname,
                 "service":     "SNMP-CPU",
                 "check":       f"check_snmp!-C {snmp_community} -v {snmp_version} -o .1.3.6.1.4.1.9.2.1.58.0 -w 80 -c 90",
-                "description": "SNMP CPU Load Cisco",
-            },
-        ]
+                "description": "SNMP CPU Load (Cisco)",
+            })
+        services += snmp_services
 
     elif host["check_method"] == "nrpe":
+        # check_nrpe uses $HOSTADDRESS$ and port from the command definition;
+        # we pass only the NRPE command name as $ARG1$
         services += [
             {
                 "hostname":    hostname,
                 "service":     "NRPE-CPU",
-                "check":       f"check_nrpe!-H {host['address']} -p {nrpe_port} -c check_load",
+                "check":       "check_nrpe!check_load",
                 "description": "CPU Load NRPE",
             },
             {
                 "hostname":    hostname,
                 "service":     "NRPE-DISK",
-                "check":       f"check_nrpe!-H {host['address']} -p {nrpe_port} -c check_disk",
+                "check":       "check_nrpe!check_disk",
                 "description": "Disk Usage NRPE",
             },
             {
                 "hostname":    hostname,
                 "service":     "NRPE-MEMORY",
-                "check":       f"check_nrpe!-H {host['address']} -p {nrpe_port} -c check_mem",
+                "check":       "check_nrpe!check_mem",
                 "description": "Memory Usage NRPE",
             },
         ]
@@ -286,6 +290,17 @@ def _build_hostgroups(hosts: list) -> dict:
             groups[group_name] = {"name": group_name, "alias": alias, "members": []}
         groups[group_name]["members"].append(hostname)
 
+    # Compute these once — used to decide whether location/cluster groups are meaningful
+    location_names = {
+        h.get("location") for h in hosts
+        if h.get("type") == "device" and h.get("location") and h.get("location") != "unknown"
+    }
+    cluster_names = {
+        h.get("cluster") for h in hosts
+        if h.get("type") == "vm" and h.get("cluster") and h.get("cluster") != "unknown"
+    }
+    phone_roles = {"ip-phone", "voip-phone", "phone"}
+
     for host in hosts:
         hostname = host["hostname"]
         role     = host.get("role", "unknown")
@@ -301,16 +316,14 @@ def _build_hostgroups(hosts: list) -> dict:
         if role and role != "unknown":
             _add(f"role-{role}", f"Role: {role.title()}", hostname)
 
-        # Group by location (devices)
-        location_names = set(h.get("location") for h in hosts if h.get("type") == "device" and h.get("location") and h.get("location") != "unknown")
+        # Group by location (devices) — only when there are multiple locations
         if len(location_names) > 1:
             location = host.get("location")
             if location and location != "unknown":
                 loc_slug = location.lower().replace(" ", "-")
                 _add(f"location-{loc_slug}", f"Location: {location}", hostname)
 
-        # Group by cluster (VMs)
-        cluster_names = set(h.get("cluster") for h in hosts if h.get("type") == "vm" and h.get("cluster") and h.get("cluster") != "unknown")
+        # Group by cluster (VMs) — only when there are multiple clusters
         if len(cluster_names) > 1:
             cluster = host.get("cluster")
             if cluster and cluster != "unknown":
@@ -318,9 +331,7 @@ def _build_hostgroups(hosts: list) -> dict:
                 _add(f"cluster-{cluster_slug}", f"Cluster: {cluster}", hostname)
 
         # Phone group
-        role_slug = host.get("role", "")
-        phone_roles = ["ip-phone", "voip-phone", "phone"]
-        if any(p in role_slug for p in phone_roles):
+        if any(p in role for p in phone_roles):
             _add("all-phones", "All IP Phones", hostname)
 
     return groups
@@ -378,7 +389,6 @@ def transform(data: dict, config: dict) -> dict:
 
 if __name__ == "__main__":
     import json
-    import yaml
     from dotenv import load_dotenv
     from fetcher import fetch_all, load_config
 
