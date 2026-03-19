@@ -83,6 +83,10 @@ snmp:
     - "switch"
     - "san"
 
+  # Roles that use SNMPv3 instead of v2c (credentials come from .env)
+  # Leave empty to use v2c for all roles
+  v3_roles: []
+
   # Memory monitoring thresholds
   # Cisco ciscoMemoryPoolLargestFree OID returns bytes — thresholds in bytes
   memory_skip_roles:

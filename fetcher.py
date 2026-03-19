@@ -191,10 +191,20 @@ def fetch_clusters(client: NautobotClient) -> list:
 from utils import normalize_ifname as _normalize_ifname
 
 
-def _walk_ifnames_ssh(ip: str, community: str, timeout: int = 10, retries: int = 1) -> dict:
+def _walk_ifnames_ssh(
+    ip: str,
+    community: str,
+    timeout: int = 10,
+    retries: int = 1,
+    use_v3: bool = False,
+) -> dict:
     """
     Run snmpwalk via SSH on the Nagios VM to get ifName -> ifIndex mapping.
     Returns { ifname: ifindex }. Silently returns empty dict on failure.
+
+    When use_v3=True, credentials are read from env vars:
+      SNMP_V3_USER, SNMP_V3_SEC_LEVEL, SNMP_V3_AUTH_PROTO, SNMP_V3_AUTH_PASS,
+      SNMP_V3_PRIV_PROTO, SNMP_V3_PRIV_PASS
     """
     from utils import get_ssh_client
     result = {}
@@ -202,7 +212,21 @@ def _walk_ifnames_ssh(ip: str, community: str, timeout: int = 10, retries: int =
     try:
         client = get_ssh_client(timeout=timeout)
         try:
-            cmd = f'snmpwalk -v2c -c "{community}" -t {timeout} -r {retries} {ip} {ifname_oid}'
+            if use_v3:
+                user       = os.getenv("SNMP_V3_USER", "nagios")
+                sec_level  = os.getenv("SNMP_V3_SEC_LEVEL", "authPriv")
+                auth_proto = os.getenv("SNMP_V3_AUTH_PROTO", "SHA")
+                auth_pass  = os.getenv("SNMP_V3_AUTH_PASS", "")
+                priv_proto = os.getenv("SNMP_V3_PRIV_PROTO", "AES")
+                priv_pass  = os.getenv("SNMP_V3_PRIV_PASS", "")
+                cmd = (
+                    f'snmpwalk -v3 -l {sec_level} -u {user} '
+                    f'-a {auth_proto} -A "{auth_pass}" '
+                    f'-x {priv_proto} -X "{priv_pass}" '
+                    f'-t {timeout} -r {retries} {ip} {ifname_oid}'
+                )
+            else:
+                cmd = f'snmpwalk -v2c -c "{community}" -t {timeout} -r {retries} {ip} {ifname_oid}'
             _, stdout, _ = client.exec_command(cmd)
             output = stdout.read().decode()
         finally:
@@ -231,6 +255,7 @@ def fetch_ifindex_map(devices: list, ips_by_id: dict, roles_by_id: dict, config:
     """
     snmp_roles        = [r.lower() for r in config["nautobot"].get("snmp_roles", [])]
     cisco_roles       = [r.lower() for r in config["snmp"].get("cisco_roles", [])]
+    v3_roles          = [r.lower() for r in config["snmp"].get("v3_roles", [])]
     community_cisco   = os.getenv("SNMP_COMMUNITY_CISCO", "public")
     community_default = os.getenv("SNMP_COMMUNITY_DEFAULT", "public")
     timeout           = config["snmp"].get("timeout", 10)
@@ -257,12 +282,13 @@ def fetch_ifindex_map(devices: list, ips_by_id: dict, roles_by_id: dict, config:
         if not ip:
             continue
 
+        use_v3    = bool(v3_roles) and any(r in role for r in v3_roles)
         community = community_cisco if any(r in role for r in cisco_roles) else community_default
-        targets.append((device["id"], ip, community))
+        targets.append((device["id"], ip, community, use_v3))
 
-    for dev_id, ip, community in targets:
-        logger.info(f"SNMP ifName walk (via SSH): {ip}")
-        raw = _walk_ifnames_ssh(ip, community, timeout, retries)
+    for dev_id, ip, community, use_v3 in targets:
+        logger.info(f"SNMP ifName walk (via SSH): {ip} {'v3' if use_v3 else 'v2c'}")
+        raw = _walk_ifnames_ssh(ip, community, timeout, retries, use_v3)
         if raw:
             normalized = {}
             for ifname, ifindex in raw.items():

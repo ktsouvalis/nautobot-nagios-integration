@@ -17,6 +17,48 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# SNMP auth helper
+# ---------------------------------------------------------------------------
+
+def _snmp_auth_args(role: str, config: dict) -> str:
+    """
+    Return the check_snmp authentication fragment for a given device role.
+
+    If the role appears in snmp.v3_roles (config.yaml), returns SNMPv3 args
+    using credentials from env vars:
+      SNMP_V3_USER, SNMP_V3_AUTH_PROTO, SNMP_V3_AUTH_PASS,
+      SNMP_V3_PRIV_PROTO, SNMP_V3_PRIV_PASS, SNMP_V3_SEC_LEVEL
+
+    Otherwise falls back to SNMPv2c with the appropriate community string.
+    """
+    snmp_cfg  = config.get("snmp", {})
+    v3_roles  = [r.lower() for r in snmp_cfg.get("v3_roles", [])]
+
+    if v3_roles and any(r in role for r in v3_roles):
+        user       = os.getenv("SNMP_V3_USER", "nagios")
+        sec_level  = os.getenv("SNMP_V3_SEC_LEVEL", "authPriv")
+        auth_proto = os.getenv("SNMP_V3_AUTH_PROTO", "SHA")
+        auth_pass  = os.getenv("SNMP_V3_AUTH_PASS", "")
+        priv_proto = os.getenv("SNMP_V3_PRIV_PROTO", "AES")
+        priv_pass  = os.getenv("SNMP_V3_PRIV_PASS", "")
+        return (
+            f"-v 3 -l {sec_level} -U {user} "
+            f"-a {auth_proto} -A {auth_pass} "
+            f"-x {priv_proto} -X {priv_pass}"
+        )
+
+    # v2c fallback
+    cisco_roles = [r.lower() for r in snmp_cfg.get("cisco_roles", [])]
+    community   = (
+        os.getenv("SNMP_COMMUNITY_CISCO", "public")
+        if any(r in role for r in cisco_roles)
+        else os.getenv("SNMP_COMMUNITY_DEFAULT", "public")
+    )
+    version = snmp_cfg.get("version", "2c")
+    return f"-C {community} -v {version}"
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -160,13 +202,9 @@ def _build_vm_host(vm: dict, data: dict, config: dict) -> dict | None:
 def _build_services(host: dict, config: dict) -> list:
     """Build Nagios service dicts for a host based on its check_method."""
     services = []
-    hostname = host["hostname"]
+    hostname    = host["hostname"]
     cisco_roles = config["snmp"].get("cisco_roles", [])
-    if any(r in host["role"] for r in cisco_roles):
-        snmp_community = os.getenv("SNMP_COMMUNITY_CISCO", "public")
-    else:
-        snmp_community = os.getenv("SNMP_COMMUNITY_DEFAULT", "public")
-    snmp_version   = config["snmp"].get("version", "2c")
+    snmp_args   = _snmp_auth_args(host["role"], config)
 
     # Every host gets a ping check
     services.append({
@@ -181,7 +219,7 @@ def _build_services(host: dict, config: dict) -> list:
             {
                 "hostname":    hostname,
                 "service":     "SNMP-UPTIME",
-                "check":       f"check_snmp!-C {snmp_community} -v {snmp_version} -o .1.3.6.1.2.1.1.3.0",
+                "check":       f"check_snmp!{snmp_args} -o .1.3.6.1.2.1.1.3.0",
                 "description": "SNMP Uptime",
             },
         ]
@@ -190,7 +228,7 @@ def _build_services(host: dict, config: dict) -> list:
             snmp_services.append({
                 "hostname":    hostname,
                 "service":     "SNMP-CPU",
-                "check":       f"check_snmp!-C {snmp_community} -v {snmp_version} -o .1.3.6.1.4.1.9.2.1.58.0 -w 80 -c 90",
+                "check":       f"check_snmp!{snmp_args} -o .1.3.6.1.4.1.9.2.1.58.0 -w 80 -c 90",
                 "description": "SNMP CPU Load (Cisco)",
             })
         services += snmp_services
@@ -269,15 +307,9 @@ def _build_interface_services(host: dict, data: dict, config: dict) -> list:
     if not ifindex_map:
         return []
 
-    cisco_roles = config["snmp"].get("cisco_roles", [])
-    community = (
-        os.getenv("SNMP_COMMUNITY_CISCO", "public")
-        if any(r in host["role"] for r in cisco_roles)
-        else os.getenv("SNMP_COMMUNITY_DEFAULT", "public")
-    )
-    version = config["snmp"].get("version", "2c")
-    hostname = host["hostname"]
-    services = []
+    snmp_args = _snmp_auth_args(host["role"], config)
+    hostname  = host["hostname"]
+    services  = []
 
     interfaces = data.get("_interfaces_by_device", {}).get(device_id, [])
     for iface in interfaces:
@@ -292,19 +324,19 @@ def _build_interface_services(host: dict, data: dict, config: dict) -> list:
             {
                 "hostname":    hostname,
                 "service":     f"IFACE-{safe_name}-STATUS",
-                "check":       f"check_snmp!-C {community} -v {version} -o .1.3.6.1.2.1.2.2.1.8.{ifindex} -w 1:1 -c 1:1",
+                "check":       f"check_snmp!{snmp_args} -o .1.3.6.1.2.1.2.2.1.8.{ifindex} -w 1:1 -c 1:1",
                 "description": f"Interface {ifname} Status",
             },
             {
                 "hostname":    hostname,
                 "service":     f"IFACE-{safe_name}-IN",
-                "check":       f"check_snmp!-C {community} -v {version} -o .1.3.6.1.2.1.2.2.1.10.{ifindex}",
+                "check":       f"check_snmp!{snmp_args} -o .1.3.6.1.2.1.2.2.1.10.{ifindex}",
                 "description": f"Interface {ifname} In Octets",
             },
             {
                 "hostname":    hostname,
                 "service":     f"IFACE-{safe_name}-OUT",
-                "check":       f"check_snmp!-C {community} -v {version} -o .1.3.6.1.2.1.2.2.1.16.{ifindex}",
+                "check":       f"check_snmp!{snmp_args} -o .1.3.6.1.2.1.2.2.1.16.{ifindex}",
                 "description": f"Interface {ifname} Out Octets",
             },
         ]
@@ -332,14 +364,8 @@ def _build_bgp_services(host: dict, data: dict, config: dict) -> list:
     if not any(r in host["role"] for r in router_roles):
         return []
 
-    cisco_roles  = config["snmp"].get("cisco_roles", [])
-    community    = (
-        os.getenv("SNMP_COMMUNITY_CISCO", "public")
-        if any(r in host["role"] for r in cisco_roles)
-        else os.getenv("SNMP_COMMUNITY_DEFAULT", "public")
-    )
-    version  = config["snmp"].get("version", "2c")
-    hostname = host["hostname"]
+    snmp_args = _snmp_auth_args(host["role"], config)
+    hostname  = host["hostname"]
     device_id = host["nautobot_id"]
 
     # Collect peer IPs: from Nautobot IPs on this device's interfaces
@@ -368,7 +394,7 @@ def _build_bgp_services(host: dict, data: dict, config: dict) -> list:
         services.append({
             "hostname":    hostname,
             "service":     f"BGP-PEER-{safe_peer}",
-            "check":       f"check_snmp!-C {community} -v {version} -o {oid} -e 6 -w 6:6 -c 6:6",
+            "check":       f"check_snmp!{snmp_args} -o {oid} -e 6 -w 6:6 -c 6:6",
             "description": f"BGP Peer {peer_ip} State",
         })
 
@@ -393,14 +419,8 @@ def _build_ups_services(host: dict, config: dict) -> list:
     if not any(r in host["role"] for r in ups_roles):
         return []
 
-    cisco_roles = config["snmp"].get("cisco_roles", [])
-    community   = (
-        os.getenv("SNMP_COMMUNITY_CISCO", "public")
-        if any(r in host["role"] for r in cisco_roles)
-        else os.getenv("SNMP_COMMUNITY_DEFAULT", "public")
-    )
-    version  = config["snmp"].get("version", "2c")
-    hostname = host["hostname"]
+    snmp_args = _snmp_auth_args(host["role"], config)
+    hostname  = host["hostname"]
 
     ups_cfg          = config.get("ups", {})
     warn_runtime     = ups_cfg.get("warn_runtime_minutes", 15)
@@ -410,31 +430,29 @@ def _build_ups_services(host: dict, config: dict) -> list:
     warn_load        = ups_cfg.get("warn_load_pct", 80)
     crit_load        = ups_cfg.get("crit_load_pct", 95)
 
-    snmp = f"-C {community} -v {version}"
-
     return [
         {
             "hostname":    hostname,
             "service":     "UPS-BATTERY-STATUS",
-            "check":       f"check_snmp!{snmp} -o .1.3.6.1.2.1.33.1.2.1.0 -e 2 -w 2:2 -c 2:2",
+            "check":       f"check_snmp!{snmp_args} -o .1.3.6.1.2.1.33.1.2.1.0 -e 2 -w 2:2 -c 2:2",
             "description": "UPS Battery Status",
         },
         {
             "hostname":    hostname,
             "service":     "UPS-RUNTIME",
-            "check":       f"check_snmp!{snmp} -o .1.3.6.1.2.1.33.1.2.3.0 -w {warn_runtime}: -c {crit_runtime}:",
+            "check":       f"check_snmp!{snmp_args} -o .1.3.6.1.2.1.33.1.2.3.0 -w {warn_runtime}: -c {crit_runtime}:",
             "description": "UPS Estimated Runtime (minutes)",
         },
         {
             "hostname":    hostname,
             "service":     "UPS-CHARGE",
-            "check":       f"check_snmp!{snmp} -o .1.3.6.1.2.1.33.1.2.4.0 -w {warn_charge}: -c {crit_charge}:",
+            "check":       f"check_snmp!{snmp_args} -o .1.3.6.1.2.1.33.1.2.4.0 -w {warn_charge}: -c {crit_charge}:",
             "description": "UPS Battery Charge (%)",
         },
         {
             "hostname":    hostname,
             "service":     "UPS-OUTPUT-LOAD",
-            "check":       f"check_snmp!{snmp} -o .1.3.6.1.2.1.33.1.4.4.1.5.1 -w {warn_load} -c {crit_load}",
+            "check":       f"check_snmp!{snmp_args} -o .1.3.6.1.2.1.33.1.4.4.1.5.1 -w {warn_load} -c {crit_load}",
             "description": "UPS Output Load (%)",
         },
     ]
@@ -469,13 +487,8 @@ def _build_memory_services(host: dict, config: dict) -> list:
 
     cisco_roles = config["snmp"].get("cisco_roles", [])
     is_cisco    = any(r in host["role"] for r in cisco_roles)
-    community   = (
-        os.getenv("SNMP_COMMUNITY_CISCO", "public") if is_cisco
-        else os.getenv("SNMP_COMMUNITY_DEFAULT", "public")
-    )
-    version  = config["snmp"].get("version", "2c")
-    hostname = host["hostname"]
-    snmp     = f"-C {community} -v {version}"
+    snmp_args   = _snmp_auth_args(host["role"], config)
+    hostname    = host["hostname"]
 
     if is_cisco:
         # Cisco: alert when free processor-pool memory drops below threshold
@@ -486,7 +499,7 @@ def _build_memory_services(host: dict, config: dict) -> list:
                 "hostname":    hostname,
                 "service":     "SNMP-MEMORY-CISCO",
                 "check":       (
-                    f"check_snmp!{snmp} "
+                    f"check_snmp!{snmp_args} "
                     f"-o .1.3.6.1.4.1.9.9.48.1.1.1.6.1 "
                     f"-w {warn_free_bytes}: -c {crit_free_bytes}: "
                     f"-l 'Processor Pool Free (bytes)'"
@@ -501,7 +514,7 @@ def _build_memory_services(host: dict, config: dict) -> list:
                 "hostname":    hostname,
                 "service":     "SNMP-MEMORY-USED",
                 "check":       (
-                    f"check_snmp!{snmp} "
+                    f"check_snmp!{snmp_args} "
                     f"-o .1.3.6.1.2.1.25.2.3.1.6.1 "
                     f"-l 'RAM Used (allocation units)'"
                 ),
@@ -511,7 +524,7 @@ def _build_memory_services(host: dict, config: dict) -> list:
                 "hostname":    hostname,
                 "service":     "SNMP-MEMORY-SIZE",
                 "check":       (
-                    f"check_snmp!{snmp} "
+                    f"check_snmp!{snmp_args} "
                     f"-o .1.3.6.1.2.1.25.2.3.1.5.1 "
                     f"-l 'RAM Size (allocation units)'"
                 ),
