@@ -61,6 +61,8 @@ def _render_host(host: dict, config: dict) -> str:
         f"    contact_groups          admins",
         f"    ; nautobot_id={host['nautobot_id']} type={host['type']} role={host['role']} method={host['check_method']}",
     ]
+    if host.get("parents"):
+        lines.append(f"    parents                 {host['parents']}")
     if host.get("comments"):
         lines.append(f"    notes                   {host['comments']}")
     lines.append("}")

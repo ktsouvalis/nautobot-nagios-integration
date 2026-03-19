@@ -338,6 +338,83 @@ def _build_hostgroups(hosts: list) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Parent-child topology builder
+# ---------------------------------------------------------------------------
+
+def _build_parent_map(data: dict, hostname_by_device_id: dict) -> dict:
+    """
+    Parse cable data to build { child_hostname: parent_hostname } mapping.
+
+    Logic: for each cable, the device with the higher-priority role
+    (router > firewall > switch > other) is the parent.  If both ends
+    are the same role tier, the one whose interface name sorts first is
+    treated as parent (deterministic but arbitrary).
+
+    Only physical device-to-device cables are considered; VM and
+    unresolvable endpoints are skipped.
+    """
+    ROLE_TIER = {"router": 0, "firewall": 1, "switch": 2}
+    roles_by_id = data.get("_roles_by_id", {})
+
+    def _tier(device_id: str) -> int:
+        # Find the device and resolve its role tier
+        for dev in data.get("devices", []):
+            if dev["id"] == device_id:
+                role_obj = dev.get("role", {})
+                role_id  = role_obj.get("id") if role_obj else None
+                role     = roles_by_id.get(role_id, {}).get("name", "").lower().replace(" ", "-") if role_id else ""
+                for key, t in ROLE_TIER.items():
+                    if key in role:
+                        return t
+                return 99
+        return 99
+
+    parent_map = {}  # { child_hostname: parent_hostname }
+
+    for cable in data.get("cables", []):
+        # Nautobot 2.x cable terminations
+        a_terms = cable.get("a_terminations", [])
+        b_terms = cable.get("b_terminations", [])
+        if not a_terms or not b_terms:
+            continue
+
+        a = a_terms[0]
+        b = b_terms[0]
+
+        # Only device interfaces (not circuits, console ports, etc.)
+        if a.get("object_type") != "dcim.interface" or b.get("object_type") != "dcim.interface":
+            continue
+
+        a_dev_id = a.get("object", {}).get("device", {}).get("id")
+        b_dev_id = b.get("object", {}).get("device", {}).get("id")
+
+        if not a_dev_id or not b_dev_id or a_dev_id == b_dev_id:
+            continue
+
+        a_host = hostname_by_device_id.get(a_dev_id)
+        b_host = hostname_by_device_id.get(b_dev_id)
+        if not a_host or not b_host:
+            continue
+
+        a_tier = _tier(a_dev_id)
+        b_tier = _tier(b_dev_id)
+
+        if a_tier < b_tier:
+            parent, child = a_host, b_host
+        elif b_tier < a_tier:
+            parent, child = b_host, a_host
+        else:
+            # Same tier — use alphabetical order for determinism
+            parent, child = sorted([a_host, b_host])
+
+        # Only set parent if not already set (first cable wins)
+        parent_map.setdefault(child, parent)
+
+    logger.info(f"Built parent map: {len(parent_map)} child→parent relationships")
+    return parent_map
+
+
+# ---------------------------------------------------------------------------
 # Main transform orchestrator
 # ---------------------------------------------------------------------------
 
@@ -367,6 +444,12 @@ def transform(data: dict, config: dict) -> dict:
         if host:
             hosts.append(host)
             services.extend(_build_services(host, config))
+
+    # --- Parent-child topology ---
+    hostname_by_device_id = {h["nautobot_id"]: h["hostname"] for h in hosts if h["type"] == "device"}
+    parent_map = _build_parent_map(data, hostname_by_device_id)
+    for host in hosts:
+        host["parents"] = parent_map.get(host["hostname"], "")
 
     hostgroups = _build_hostgroups(hosts)
 
