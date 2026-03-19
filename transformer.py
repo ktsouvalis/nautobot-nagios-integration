@@ -11,7 +11,7 @@ Uses field names confirmed from live Nautobot 2.x API output.
 
 import logging
 import os
-from utils import normalize_ifname
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -20,19 +20,23 @@ logger = logging.getLogger(__name__)
 # SNMP auth helper
 # ---------------------------------------------------------------------------
 
-def _snmp_auth_args(role: str, config: dict) -> str:
+def _snmp_auth_args(role: str, config: dict, for_snmp_int: bool = False) -> str:
     """
-    Return the check_snmp authentication fragment for a given device role.
+    Return SNMP authentication CLI args for a given device role.
 
-    If the role appears in snmp.v3_roles (config.yaml), returns SNMPv3 args
-    using credentials from env vars:
-      SNMP_V3_USER, SNMP_V3_AUTH_PROTO, SNMP_V3_AUTH_PASS,
-      SNMP_V3_PRIV_PROTO, SNMP_V3_PRIV_PASS, SNMP_V3_SEC_LEVEL
+    for_snmp_int=False (default) → check_snmp plugin flags:
+      SNMPv3: -U (uppercase) for username; v2c: -P <version>
+    for_snmp_int=True → check_snmp_int.pl (manubulon) plugin flags:
+      SNMPv3: -u (lowercase) for username; v2c: -2 (manubulon -v means verbose)
 
-    Otherwise falls back to SNMPv2c with the appropriate community string.
+    Credentials are read from env vars:
+      SNMP_V3_USER, SNMP_V3_SEC_LEVEL, SNMP_V3_AUTH_PROTO, SNMP_V3_AUTH_PASS,
+      SNMP_V3_PRIV_PROTO, SNMP_V3_PRIV_PASS, SNMP_COMMUNITY_CISCO,
+      SNMP_COMMUNITY_DEFAULT
     """
-    snmp_cfg  = config.get("snmp", {})
-    v3_roles  = [r.lower() for r in snmp_cfg.get("v3_roles", [])]
+    snmp_cfg    = config.get("snmp", {})
+    v3_roles    = [r.lower() for r in snmp_cfg.get("v3_roles", [])]
+    cisco_roles = [r.lower() for r in snmp_cfg.get("cisco_roles", [])]
 
     if v3_roles and any(r in role for r in v3_roles):
         user       = os.getenv("SNMP_V3_USER", "nagios")
@@ -41,21 +45,23 @@ def _snmp_auth_args(role: str, config: dict) -> str:
         auth_pass  = os.getenv("SNMP_V3_AUTH_PASS", "")
         priv_proto = os.getenv("SNMP_V3_PRIV_PROTO", "AES")
         priv_pass  = os.getenv("SNMP_V3_PRIV_PASS", "")
+        u_flag = "-u" if for_snmp_int else "-U"
         return (
-            f"-v 3 -l {sec_level} -U {user} "
+            f"-v 3 -l {sec_level} {u_flag} {user} "
             f"-a {auth_proto} -A {auth_pass} "
             f"-x {priv_proto} -X {priv_pass}"
         )
 
-    # v2c fallback
-    cisco_roles = [r.lower() for r in snmp_cfg.get("cisco_roles", [])]
-    community   = (
+    community = (
         os.getenv("SNMP_COMMUNITY_CISCO", "public")
         if any(r in role for r in cisco_roles)
         else os.getenv("SNMP_COMMUNITY_DEFAULT", "public")
     )
+    if for_snmp_int:
+        version = snmp_cfg.get("version", "2c")
+        return f"-C {community} -2" if version == "2c" else f"-C {community}"
     version = snmp_cfg.get("version", "2c")
-    return f"-C {community} -v {version}"
+    return f"-C {community} -P {version}"
 
 
 # ---------------------------------------------------------------------------
@@ -318,49 +324,80 @@ def _build_ssl_services(host: dict, config: dict) -> list:
     return services
 
 
+def _ifname_to_snmp_filter(ifname: str, hostname: str, config: dict) -> str:
+    """
+    Return the check_snmp_int -n filter string for an interface.
+
+    Most devices (Cisco etc.) expose ifDescr matching the Nautobot name directly,
+    so the name is returned as-is.
+
+    Some vendors (e.g. D-Link) use "Unit: X Slot: Y Port: Z Type - Level" in
+    ifDescr.  List those device hostnames in snmp.unit_slot_port_devices and this
+    function will convert GigabitEthernetU/S/P → "Unit: U Slot: S Port: P Gigabit",
+    TenGigabitEthernetU/S/P → "Unit: U Slot: S Port: P 10G",
+    Port-channelN → "Link Aggregate N".
+    """
+    usp_devices = [d.upper() for d in config.get("snmp", {}).get("unit_slot_port_devices", [])]
+    if hostname.upper() not in usp_devices:
+        return ifname
+
+    m = re.match(r"^(GigabitEthernet|TenGigabitEthernet|FastEthernet)(\d+)/(\d+)/(\d+)$", ifname)
+    if m:
+        prefix, unit, slot, port = m.group(1), m.group(2), m.group(3), m.group(4)
+        type_str = {"GigabitEthernet": "Gigabit", "TenGigabitEthernet": "10G", "FastEthernet": "Fast Ethernet"}.get(prefix, prefix)
+        return f"Unit: {unit} Slot: {slot} Port: {port} {type_str}"
+
+    m = re.match(r"^[Pp]ort-channel(\d+)$", ifname)
+    if m:
+        return f"Link Aggregate {m.group(1)}"
+
+    return ifname
+
+
 def _build_interface_services(host: dict, data: dict, config: dict) -> list:
-    """Build SNMP interface services for SNMP-capable devices with ifIndex map."""
+    """
+    Build check_snmp_int interface services for SNMP-capable devices.
+
+    Uses check_snmp_int.pl (manubulon) instead of raw check_snmp, which gives:
+    - Automatic ifIndex resolution by interface name (no pre-walk needed)
+    - On-disk state storage (-k) so the plugin computes bytes/sec internally
+    - Performance data output (-f): traffic_in=<bytes/s>B/s traffic_out=<bytes/s>B/s
+
+    One service per interface replaces the former STATUS + IN + OUT triple.
+    The service alerts CRITICAL if ifOperStatus is not Up (replaces STATUS check)
+    and emits traffic rates for the network map tooltip (replaces IN/OUT checks).
+    """
     if host["check_method"] != "snmp" or host["type"] != "device":
         return []
 
-    device_id = host["nautobot_id"]
-    ifindex_map = data.get("_ifindex_map", {}).get(device_id)
-    if not ifindex_map:
+    device_id  = host["nautobot_id"]
+    interfaces = data.get("_interfaces_by_device", {}).get(device_id, [])
+    if not interfaces:
         return []
 
-    snmp_args = _snmp_auth_args(host["role"], config)
+    snmp_args = _snmp_auth_args(host["role"], config, for_snmp_int=True)
     hostname  = host["hostname"]
     services  = []
+    # Bandwidth thresholds (bytes/sec, in and out).  Defaults are set very high
+    # so the check only alerts on interface down, not on bandwidth saturation.
+    warn_bps  = config["snmp"].get("int_warn_bps", 999999999)
+    crit_bps  = config["snmp"].get("int_crit_bps", 999999999)
 
-    interfaces = data.get("_interfaces_by_device", {}).get(device_id, [])
     for iface in interfaces:
         ifname = iface.get("name", "")
-        ifindex = ifindex_map.get(ifname) or ifindex_map.get(normalize_ifname(ifname))
-        if ifindex is None:
+        if not ifname:
             continue
 
+        snmp_filter = _ifname_to_snmp_filter(ifname, hostname, config)
         safe_name = ifname.replace("/", "-").replace(" ", "_")
-
-        services += [
-            {
-                "hostname":    hostname,
-                "service":     f"IFACE-{safe_name}-STATUS",
-                "check":       f"check_snmp!{snmp_args} -o .1.3.6.1.2.1.2.2.1.8.{ifindex} -w 1:1 -c 1:1",
-                "description": f"Interface {ifname} Status",
-            },
-            {
-                "hostname":    hostname,
-                "service":     f"IFACE-{safe_name}-IN",
-                "check":       f"check_snmp!{snmp_args} -o .1.3.6.1.2.1.2.2.1.10.{ifindex}",
-                "description": f"Interface {ifname} In Octets",
-            },
-            {
-                "hostname":    hostname,
-                "service":     f"IFACE-{safe_name}-OUT",
-                "check":       f"check_snmp!{snmp_args} -o .1.3.6.1.2.1.2.2.1.16.{ifindex}",
-                "description": f"Interface {ifname} Out Octets",
-            },
-        ]
+        # Anchor the regex so "Gi1/0/2" doesn't also match "Gi1/0/20", "Gi1/0/21" etc.
+        snmp_regex = f"^{snmp_filter}$"
+        services.append({
+            "hostname":    hostname,
+            "service":     f"IFACE-{safe_name}",
+            "check":       f"check_snmp_int!{snmp_args} -n {snmp_regex} -k -f -w {warn_bps},{warn_bps} -c {crit_bps},{crit_bps}",
+            "description": f"Interface {ifname} Traffic",
+        })
 
     return services
 
@@ -571,18 +608,27 @@ def _build_memory_services(host: dict, config: dict) -> list:
 # Hostgroup builder
 # ---------------------------------------------------------------------------
 
-def _build_hostgroups(hosts: list) -> dict:
+def _build_hostgroups(hosts: list, config: dict = None) -> dict:
     """
     Build hostgroup dicts from host list.
     Groups by: role, location (devices), cluster (VMs), type (devices/vms/phones)
+    Also builds named category groups from hostgroups config (e.g. network-devices, servers, storage).
     Returns dict of { hostgroup_name: { name, alias, members[] } }
     """
     groups = {}
+    config = config or {}
 
     def _add(group_name: str, alias: str, hostname: str):
         if group_name not in groups:
             groups[group_name] = {"name": group_name, "alias": alias, "members": []}
         groups[group_name]["members"].append(hostname)
+
+    # Build category lookup: role_slug -> (group_name, alias)
+    category_by_role = {}
+    for group_name, cfg in config.get("hostgroups", {}).items():
+        alias = cfg.get("alias", group_name.replace("-", " ").title())
+        for r in cfg.get("roles", []):
+            category_by_role[r.lower()] = (group_name, alias)
 
     # Compute these once — used to decide whether location/cluster groups are meaningful
     location_names = {
@@ -604,11 +650,18 @@ def _build_hostgroups(hosts: list) -> dict:
         if htype == "device":
             _add("all-devices", "All Physical Devices", hostname)
         elif htype == "vm":
-            _add("all-vms", "All Virtual Machines", hostname)
+            _add("vms", "VMs", hostname)
+
+        # Named category groups (network-devices, servers, storage, …)
+        if role and role != "unknown":
+            for cat_role, (group_name, alias) in category_by_role.items():
+                if cat_role in role:
+                    _add(group_name, alias, hostname)
+                    break
 
         # Group by role
         if role and role != "unknown":
-            _add(f"role-{role}", f"Role: {role.title()}", hostname)
+            _add(f"{role}", f"Role: {role.title()}", hostname)
 
         # Location groups are only useful when devices span more than one site.
         # A single-location deployment would get a group of all devices which is
@@ -755,7 +808,7 @@ def transform(data: dict, config: dict) -> dict:
     for host in hosts:
         host["parents"] = parent_map.get(host["hostname"], "")
 
-    hostgroups = _build_hostgroups(hosts)
+    hostgroups = _build_hostgroups(hosts, config)
 
     logger.info(
         f"Transformed {len(hosts)} hosts, "

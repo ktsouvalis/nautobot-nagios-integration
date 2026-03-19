@@ -142,11 +142,23 @@ def write(result: dict, config: dict):
         "# ============================================================\n\n"
     )
 
+    # Command definition for check_snmp_int (manubulon plugin).
+    # Written alongside the other generated configs so Nagios picks it up automatically.
+    nagios_libexec = config["nagios"].get("nagios_libexec", "/usr/local/nagios/libexec")
+    commands_content = (
+        header
+        + "define command {\n"
+        + "    command_name    check_snmp_int\n"
+        + f"    command_line    {nagios_libexec}/check_snmp_int.pl -H $HOSTADDRESS$ $ARG1$\n"
+        + "}\n"
+    )
+
     # Build file contents
     files = {
-        "nautobot_hosts.cfg": _build_hosts_content(result, config, header),
-        "nautobot_services.cfg": _build_services_content(result, config, header),
+        "nautobot_hosts.cfg":     _build_hosts_content(result, config, header),
+        "nautobot_services.cfg":  _build_services_content(result, config, header),
         "nautobot_hostgroups.cfg": _build_hostgroups_content(result, header),
+        "nautobot_commands.cfg":  commands_content,
     }
 
     # Write to local temp dir
