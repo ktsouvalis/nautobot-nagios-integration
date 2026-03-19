@@ -147,8 +147,6 @@ def _build_network_graph(result: dict, data: dict, config: dict) -> tuple[list, 
         ifname_b = iface_b.get("name", "?")
         short_a  = shorten_ifname(ifname_a)
         short_b  = shorten_ifname(ifname_b)
-        safe_a   = ifname_a.replace("/", "-").replace(" ", "_")
-        safe_b   = ifname_b.replace("/", "-").replace(" ", "_")
         svc_a     = f"Interface {ifname_a} Status"    if iface_a.get("name") else None
         svc_b     = f"Interface {ifname_b} Status"    if iface_b.get("name") else None
         svc_a_in  = f"Interface {ifname_a} In Octets" if iface_a.get("name") else None
@@ -294,7 +292,7 @@ def _build_hosts_graph(result: dict, data: dict, config: dict) -> tuple[list, li
     return nodes, edges
 
 
-def _build_vm_graph(result: dict, data: dict) -> tuple[list, list]:
+def _build_vm_graph(result: dict) -> tuple[list, list]:
     """VMs connected to their hypervisor parent node."""
     nodes = []
     edges = []
@@ -615,18 +613,28 @@ async function refreshStatus() {{
       // Fall back to last known speed so values don't vanish between refresh cycles
       let rxSpeed = lastSpeeds[id]?.rx ?? null;
       let txSpeed = lastSpeeds[id]?.tx ?? null;
-      if (prev && rxARaw !== null && txARaw !== null) {{
-        const dt = now - prev.ts;
-        // Ignore deltas > 5 min (stale sessionStorage from a much earlier visit)
-        // and guard against 32-bit counter wrap (rxARaw < prev.rxA)
-        if (dt > 0 && dt < 300 && rxARaw >= prev.rxA && txARaw >= prev.txA) {{
-          rxSpeed = (rxARaw - prev.rxA) / dt;
-          txSpeed = (txARaw - prev.txA) / dt;
-          lastSpeeds[id] = {{ rx: rxSpeed, tx: txSpeed }};
+
+      if (rxARaw !== null && txARaw !== null) {{
+        const valuesChanged = !prev || rxARaw !== prev.rxA || txARaw !== prev.txA;
+        if (valuesChanged) {{
+          // A new Nagios SNMP check has run — compute speed using the actual
+          // elapsed time since the previous check result (not since last map refresh).
+          // This gives accurate bytes/s regardless of check_interval vs refresh_interval.
+          if (prev && rxARaw >= prev.rxA && txARaw >= prev.txA) {{
+            const dt = now - prev.ts;
+            // Sanity: ignore if delta > 30 min (sessionStorage from a much older session)
+            if (dt > 0 && dt < 1800) {{
+              rxSpeed = (rxARaw - prev.rxA) / dt;
+              txSpeed = (txARaw - prev.txA) / dt;
+              lastSpeeds[id] = {{ rx: rxSpeed, tx: txSpeed }};
+            }}
+          }}
+          // Record this new reading with the current timestamp
+          prevOctets[id] = {{ rxA: rxARaw, txA: txARaw, ts: now }};
         }}
+        // If values haven't changed yet (Nagios check hasn't re-run),
+        // keep showing lastSpeeds — no update to prevOctets needed.
       }}
-      if (rxARaw !== null && txARaw !== null)
-        prevOctets[id] = {{ rxA: rxARaw, txA: txARaw, ts: now }};
 
       // Persist both dicts so the next page load starts with data
       sessionStorage.setItem('prevOctets', JSON.stringify(prevOctets));
@@ -678,7 +686,7 @@ def generate_maps(result: dict, data: dict, config: dict):
         (
             config["maps"]["vm_map"],
             "ESDA Lab — VM Map",
-            *_build_vm_graph(result, data),
+            *_build_vm_graph(result),
         ),
         (
             config["maps"]["phone_map"],
