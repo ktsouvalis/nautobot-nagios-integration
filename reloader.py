@@ -5,6 +5,8 @@ Connects to Nagios VM, runs nagios -v to validate, then reloads if clean.
 """
 
 import logging
+import re
+import shlex
 
 import yaml
 from dotenv import load_dotenv
@@ -21,9 +23,9 @@ def load_config(path: str = "config.yaml") -> dict:
         return yaml.safe_load(f)
 
 
-def _run(ssh: paramiko.SSHClient, cmd: str) -> tuple[int, str, str]:
+def _run(ssh, cmd: str) -> tuple[int, str, str]:
     """Run a command over SSH, return (exit_code, stdout, stderr)."""
-    stdin, stdout, stderr = ssh.exec_command(cmd)
+    _, stdout, stderr = ssh.exec_command(cmd)
     exit_code = stdout.channel.recv_exit_status()
     return exit_code, stdout.read().decode(), stderr.read().decode()
 
@@ -46,7 +48,7 @@ def validate_and_reload(config: dict) -> bool:
         logger.info(f"Running: {validate_cmd}")
         exit_code, stdout, stderr = _run(ssh, validate_cmd)
 
-        if exit_code != 0 or "Total Errors:   0" not in stdout:
+        if exit_code != 0 or not re.search(r"Total Errors:\s+0", stdout):
             logger.error("Nagios config validation FAILED:")
             # Log only error lines
             for line in stdout.splitlines():

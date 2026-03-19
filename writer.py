@@ -11,6 +11,7 @@ Writes locally to a temp dir, then SCPs to Nagios VM via paramiko.
 
 import logging
 import os
+import shlex
 import tempfile
 
 import yaml
@@ -157,7 +158,7 @@ def write(result: dict, config: dict):
                 sftp.stat(remote_dir)
             except FileNotFoundError:
                 # mkdir -p via SSH
-                _, stdout, _ = ssh.exec_command(f"sudo mkdir -p {remote_dir}")
+                _, stdout, _ = ssh.exec_command(f"sudo mkdir -p {shlex.quote(remote_dir)}")
                 stdout.channel.recv_exit_status()
 
             for fname, local_path in local_files.items():

@@ -104,7 +104,7 @@ maps:
   phone_map: "phone-map.html"
   hosts_map: "hosts-map.html"
 
-# Roles per map
+  # Roles per map
   network_roles:
     - "switch"
     - "router"
