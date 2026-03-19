@@ -522,7 +522,13 @@ const HOST_STATE_COLORS = {{
   8: "#e67e22",   // UNREACHABLE
 }};
 
-const prevOctets = {{}};  // {{ edgeId: {{ rxA, txA, ts }} }}
+// Persist octet counters across page navigation so the first refresh after a
+// reload can immediately compute speed instead of waiting for a second reading.
+const prevOctets  = JSON.parse(sessionStorage.getItem('prevOctets')  || '{{}}');
+// Cache the last successfully computed speed so it is shown while waiting for
+// the next reading (avoids flashing "..." on every page load after the first).
+const lastSpeeds  = JSON.parse(sessionStorage.getItem('lastSpeeds')  || '{{}}');
+
 async function refreshStatus() {{
   try {{
     const svcUrl  = `${{NAGIOS_URL}}/cgi-bin/statusjson.cgi?query=servicelist&details=true&hostname=all`;
@@ -606,16 +612,25 @@ async function refreshStatus() {{
       const rxARaw = getRaw(edge.host_a, edge.svc_a_in);
       const txARaw = getRaw(edge.host_a, edge.svc_a_out);
       const prev   = prevOctets[id];
-      let rxSpeed = null, txSpeed = null;
+      // Fall back to last known speed so values don't vanish between refresh cycles
+      let rxSpeed = lastSpeeds[id]?.rx ?? null;
+      let txSpeed = lastSpeeds[id]?.tx ?? null;
       if (prev && rxARaw !== null && txARaw !== null) {{
         const dt = now - prev.ts;
-        if (dt > 0) {{
+        // Ignore deltas > 5 min (stale sessionStorage from a much earlier visit)
+        // and guard against 32-bit counter wrap (rxARaw < prev.rxA)
+        if (dt > 0 && dt < 300 && rxARaw >= prev.rxA && txARaw >= prev.txA) {{
           rxSpeed = (rxARaw - prev.rxA) / dt;
           txSpeed = (txARaw - prev.txA) / dt;
+          lastSpeeds[id] = {{ rx: rxSpeed, tx: txSpeed }};
         }}
       }}
       if (rxARaw !== null && txARaw !== null)
         prevOctets[id] = {{ rxA: rxARaw, txA: txARaw, ts: now }};
+
+      // Persist both dicts so the next page load starts with data
+      sessionStorage.setItem('prevOctets', JSON.stringify(prevOctets));
+      sessionStorage.setItem('lastSpeeds', JSON.stringify(lastSpeeds));
 
       const tip = `${{edge.host_a}}:${{edge.ifname_a}} ↔ ${{edge.host_b}}:${{edge.ifname_b}}`
         + `\n↓ RX: ${{fmtSpeed(rxSpeed)}}`
