@@ -90,6 +90,27 @@ nrpe:
 
 
 # =============================================================================
+# UPS monitoring (RFC 1628 UPS-MIB via SNMP)
+# =============================================================================
+ups:
+  # Roles that should have UPS-MIB checks generated
+  ups_roles:
+    - "ups"
+
+  # Runtime thresholds (minutes remaining on battery)
+  warn_runtime_minutes: 15
+  crit_runtime_minutes: 5
+
+  # Charge thresholds (% remaining)
+  warn_charge_pct: 50
+  crit_charge_pct: 20
+
+  # Output load thresholds (% of rated capacity)
+  warn_load_pct: 80
+  crit_load_pct: 95
+
+
+# =============================================================================
 # BGP monitoring
 # =============================================================================
 bgp:

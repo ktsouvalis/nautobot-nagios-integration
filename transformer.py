@@ -337,6 +337,71 @@ def _build_bgp_services(host: dict, data: dict, config: dict) -> list:
     return services
 
 
+def _build_ups_services(host: dict, config: dict) -> list:
+    """
+    Build UPS-MIB SNMP checks for UPS-role devices (RFC 1628).
+
+    Checks:
+      - Battery status      upsBatteryStatus (.1.3.6.1.2.1.33.1.2.1.0)
+                            1=unknown, 2=batteryNormal, 3=batteryLow, 4=batteryDepleted
+      - Estimated runtime   upsEstimatedMinutesRemaining (.1.3.6.1.2.1.33.1.2.3.0)
+      - Battery charge %    upsEstimatedChargeRemaining (.1.3.6.1.2.1.33.1.2.4.0)
+      - Output load %       upsOutputPercentLoad (.1.3.6.1.2.1.33.1.4.4.1.5.1)
+    """
+    ups_roles = [r.lower() for r in config.get("ups", {}).get("ups_roles", ["ups"])]
+
+    if host["check_method"] != "snmp" or host["type"] != "device":
+        return []
+    if not any(r in host["role"] for r in ups_roles):
+        return []
+
+    cisco_roles = config["snmp"].get("cisco_roles", [])
+    community   = (
+        os.getenv("SNMP_COMMUNITY_CISCO", "public")
+        if any(r in host["role"] for r in cisco_roles)
+        else os.getenv("SNMP_COMMUNITY_DEFAULT", "public")
+    )
+    version  = config["snmp"].get("version", "2c")
+    hostname = host["hostname"]
+
+    ups_cfg          = config.get("ups", {})
+    warn_runtime     = ups_cfg.get("warn_runtime_minutes", 15)
+    crit_runtime     = ups_cfg.get("crit_runtime_minutes", 5)
+    warn_charge      = ups_cfg.get("warn_charge_pct", 50)
+    crit_charge      = ups_cfg.get("crit_charge_pct", 20)
+    warn_load        = ups_cfg.get("warn_load_pct", 80)
+    crit_load        = ups_cfg.get("crit_load_pct", 95)
+
+    snmp = f"-C {community} -v {version}"
+
+    return [
+        {
+            "hostname":    hostname,
+            "service":     "UPS-BATTERY-STATUS",
+            "check":       f"check_snmp!{snmp} -o .1.3.6.1.2.1.33.1.2.1.0 -e 2 -w 2:2 -c 2:2",
+            "description": "UPS Battery Status",
+        },
+        {
+            "hostname":    hostname,
+            "service":     "UPS-RUNTIME",
+            "check":       f"check_snmp!{snmp} -o .1.3.6.1.2.1.33.1.2.3.0 -w {warn_runtime}: -c {crit_runtime}:",
+            "description": "UPS Estimated Runtime (minutes)",
+        },
+        {
+            "hostname":    hostname,
+            "service":     "UPS-CHARGE",
+            "check":       f"check_snmp!{snmp} -o .1.3.6.1.2.1.33.1.2.4.0 -w {warn_charge}: -c {crit_charge}:",
+            "description": "UPS Battery Charge (%)",
+        },
+        {
+            "hostname":    hostname,
+            "service":     "UPS-OUTPUT-LOAD",
+            "check":       f"check_snmp!{snmp} -o .1.3.6.1.2.1.33.1.4.4.1.5.1 -w {warn_load} -c {crit_load}",
+            "description": "UPS Output Load (%)",
+        },
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Hostgroup builder
 # ---------------------------------------------------------------------------
@@ -502,6 +567,7 @@ def transform(data: dict, config: dict) -> dict:
             services.extend(_build_services(host, config))
             services.extend(_build_interface_services(host, data, config))
             services.extend(_build_bgp_services(host, data, config))
+            services.extend(_build_ups_services(host, config))
 
     # --- VMs ---
     for vm in data["vms"]:
