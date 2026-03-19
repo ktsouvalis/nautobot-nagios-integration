@@ -48,6 +48,9 @@ def validate_and_reload(config: dict) -> bool:
         logger.info(f"Running: {validate_cmd}")
         exit_code, stdout, stderr = _run(ssh, validate_cmd)
 
+        # re.search with \s+ handles varying whitespace between "Total Errors:" and
+        # the count across different Nagios versions (e.g. "Total Errors:   0" vs
+        # "Total Errors: 0").  A plain string check would miss unexpected spacing.
         if exit_code != 0 or not re.search(r"Total Errors:\s+0", stdout):
             logger.error("Nagios config validation FAILED:")
             # Log only error lines

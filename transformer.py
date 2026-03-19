@@ -409,9 +409,15 @@ def _build_bgp_services(host: dict, data: dict, config: dict) -> list:
 
     services = []
     for peer_ip in sorted(peer_ips):
-        # Convert dotted-decimal IP to OID suffix (e.g. 10.0.0.1 → 10.0.0.1)
+        # BGP4-MIB bgpPeerState OID suffix is the peer IP in dotted-decimal notation.
+        # e.g. peer 10.0.0.1 → OID .1.3.6.1.2.1.15.3.1.2.10.0.0.1
         oid = f".1.3.6.1.2.1.15.3.1.2.{peer_ip}"
         safe_peer = peer_ip.replace(".", "-")
+        # check_snmp flag meanings:
+        #   -e 6        → expected string/value is "6" (Established state)
+        #   -w 6:6      → warn if value outside range [6,6] (i.e. anything != 6)
+        #   -c 6:6      → crit under same condition (we skip warning, go straight to critical)
+        # BGP peer state integers: 1=Idle, 2=Connect, 3=Active, 4=OpenSent, 5=OpenConfirm, 6=Established
         services.append({
             "hostname":    hostname,
             "service":     f"BGP-PEER-{safe_peer}",
@@ -455,18 +461,23 @@ def _build_ups_services(host: dict, config: dict) -> list:
         {
             "hostname":    hostname,
             "service":     "UPS-BATTERY-STATUS",
+            # upsBatteryStatus: 1=unknown, 2=batteryNormal, 3=batteryLow, 4=batteryDepleted
+            # -e 2 / -w 2:2 / -c 2:2 → only value 2 (Normal) is OK
             "check":       f"check_snmp!{snmp_args} -o .1.3.6.1.2.1.33.1.2.1.0 -e 2 -w 2:2 -c 2:2",
             "description": "UPS Battery Status",
         },
         {
             "hostname":    hostname,
             "service":     "UPS-RUNTIME",
+            # Trailing colon on -w/-c means "alert if below this value" (lower bound)
+            # e.g. -w 15: → warn if minutes remaining < 15
             "check":       f"check_snmp!{snmp_args} -o .1.3.6.1.2.1.33.1.2.3.0 -w {warn_runtime}: -c {crit_runtime}:",
             "description": "UPS Estimated Runtime (minutes)",
         },
         {
             "hostname":    hostname,
             "service":     "UPS-CHARGE",
+            # Same lower-bound pattern: warn if charge drops below warn_charge_pct
             "check":       f"check_snmp!{snmp_args} -o .1.3.6.1.2.1.33.1.2.4.0 -w {warn_charge}: -c {crit_charge}:",
             "description": "UPS Battery Charge (%)",
         },
@@ -512,7 +523,9 @@ def _build_memory_services(host: dict, config: dict) -> list:
     hostname    = host["hostname"]
 
     if is_cisco:
-        # Cisco: alert when free processor-pool memory drops below threshold
+        # Cisco ciscoMemoryPoolLargestFree OID returns bytes (not KB, not KB×1024).
+        # Thresholds must be set in bytes; 10 MB = 10 485 760, 4 MB = 4 194 304.
+        # We alert when free bytes drop BELOW the threshold (hence trailing colon: -w N:).
         warn_free_bytes = snmp_cfg.get("cisco_mem_warn_free_bytes", 10485760)   # 10 MB
         crit_free_bytes = snmp_cfg.get("cisco_mem_crit_free_bytes", 4194304)   #  4 MB
         return [
@@ -597,14 +610,16 @@ def _build_hostgroups(hosts: list) -> dict:
         if role and role != "unknown":
             _add(f"role-{role}", f"Role: {role.title()}", hostname)
 
-        # Group by location (devices) — only when there are multiple locations
+        # Location groups are only useful when devices span more than one site.
+        # A single-location deployment would get a group of all devices which is
+        # redundant with "all-devices", so we suppress it.
         if len(location_names) > 1:
             location = host.get("location")
             if location and location != "unknown":
                 loc_slug = location.lower().replace(" ", "-")
                 _add(f"location-{loc_slug}", f"Location: {location}", hostname)
 
-        # Group by cluster (VMs) — only when there are multiple clusters
+        # Same rationale for cluster groups — omit if all VMs are in the same cluster.
         if len(cluster_names) > 1:
             cluster = host.get("cluster")
             if cluster and cluster != "unknown":
@@ -688,7 +703,10 @@ def _build_parent_map(data: dict, hostname_by_device_id: dict) -> dict:
             # Same tier — use alphabetical order for determinism
             parent, child = sorted([a_host, b_host])
 
-        # Only set parent if not already set (first cable wins)
+        # setdefault means: if the child already has a parent assigned (from a
+        # previous cable), keep the first one found and don't overwrite it.
+        # This prevents a switch from having multiple parents if it uplinks to
+        # more than one router (the first cable processed "wins").
         parent_map.setdefault(child, parent)
 
     logger.info(f"Built parent map: {len(parent_map)} child→parent relationships")

@@ -107,6 +107,13 @@ def _render_hostgroup(hg: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def _write_local(path: str, content: str):
+    """Atomic file write: write to a temp file then rename over the target.
+
+    os.replace() is atomic on POSIX — Nagios will never see a half-written
+    config file even if we crash mid-write.  The temp file is in the same
+    directory so the rename is guaranteed to stay on the same filesystem
+    (cross-device renames would fail with EXDEV).
+    """
     dir_name = os.path.dirname(path)
     os.makedirs(dir_name, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")

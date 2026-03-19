@@ -53,6 +53,11 @@ class NautobotClient:
         """
         Convert dict to list of tuples to support repeated keys.
         e.g. {"status": ["active", "staged"]} -> [("status", "active"), ("status", "staged")]
+
+        requests.get(params=dict) collapses list values into a single
+        comma-separated string, which Nautobot does not accept.  Passing
+        a list of tuples keeps each value as a separate query parameter,
+        which is the correct way to send multi-value filters to Nautobot.
         """
         result = []
         for key, value in params.items():
@@ -82,8 +87,8 @@ class NautobotClient:
             resp.raise_for_status()
             data = resp.json()
             results.extend(data.get("results", []))
-            url = data.get("next")   # next page URL already includes params
-            param_tuples = []        # params embedded in next URL
+            url = data.get("next")   # next page URL already embeds pagination params
+            param_tuples = []        # don't re-append our params on subsequent pages
 
         logger.debug(f"Fetched {len(results)} records from {endpoint}")
         return results
@@ -292,8 +297,13 @@ def fetch_ifindex_map(devices: list, ips_by_id: dict, roles_by_id: dict, config:
         if raw:
             normalized = {}
             for ifname, ifindex in raw.items():
-                normalized[ifname] = ifindex                    # raw (MikroTik: ether1)
-                normalized[_normalize_ifname(ifname)] = ifindex # normalized (Cisco: Gi1/0/1)
+                # Store both the raw SNMP name AND the normalized Nautobot-style name so
+                # transformer.py can resolve ifIndex regardless of naming convention.
+                # MikroTik reports "ether1" (raw matches Nautobot).
+                # Cisco reports "Gi1/0/1" but Nautobot stores "GigabitEthernet1/0/1",
+                # so normalize_ifname("GigabitEthernet1/0/1") → "Gi1/0/1" for lookup.
+                normalized[ifname] = ifindex                    # raw  (as the device reports via SNMP)
+                normalized[_normalize_ifname(ifname)] = ifindex # abbreviated (matches Nautobot long names)
             result[dev_id] = normalized
             logger.info(f"  → {len(raw)} interfaces indexed")
         else:
