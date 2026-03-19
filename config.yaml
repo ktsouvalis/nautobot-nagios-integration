@@ -90,6 +90,23 @@ nrpe:
 
 
 # =============================================================================
+# BGP monitoring
+# =============================================================================
+bgp:
+  # Roles that should have BGP peer checks generated
+  router_roles:
+    - "router"
+
+  # Static peer IPs per hostname (for peers not discoverable via Nautobot
+  # interface descriptions containing "bgp")
+  # static_peers:
+  #   my-router-01:
+  #     - "192.0.2.1"
+  #     - "192.0.2.2"
+  static_peers: {}
+
+
+# =============================================================================
 # Maps configuration
 # =============================================================================
 maps:

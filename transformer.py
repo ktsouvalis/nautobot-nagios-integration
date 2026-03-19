@@ -273,6 +273,70 @@ def _build_interface_services(host: dict, data: dict, config: dict) -> list:
 
     return services
 
+
+def _build_bgp_services(host: dict, data: dict, config: dict) -> list:
+    """
+    Build BGP peer state checks for router-role SNMP devices.
+
+    Uses BGP4-MIB::bgpPeerState (.1.3.6.1.2.1.15.3.1.2.<peer_ip_as_oid>).
+    State 6 = Established; anything else is a problem.
+
+    Peer IPs are pulled from Nautobot IP addresses whose assigned interface
+    belongs to this device and whose description matches 'bgp' (case-insensitive),
+    supplemented by any statically configured peers in config.yaml under
+    bgp.static_peers[hostname].
+    """
+    bgp_cfg = config.get("bgp", {})
+    router_roles = [r.lower() for r in bgp_cfg.get("router_roles", ["router"])]
+
+    if host["check_method"] != "snmp" or host["type"] != "device":
+        return []
+    if not any(r in host["role"] for r in router_roles):
+        return []
+
+    cisco_roles  = config["snmp"].get("cisco_roles", [])
+    community    = (
+        os.getenv("SNMP_COMMUNITY_CISCO", "public")
+        if any(r in host["role"] for r in cisco_roles)
+        else os.getenv("SNMP_COMMUNITY_DEFAULT", "public")
+    )
+    version  = config["snmp"].get("version", "2c")
+    hostname = host["hostname"]
+    device_id = host["nautobot_id"]
+
+    # Collect peer IPs: from Nautobot IPs on this device's interfaces
+    peer_ips = set()
+    for iface in data.get("_interfaces_by_device", {}).get(device_id, []):
+        desc = (iface.get("description") or "").lower()
+        if "bgp" not in desc:
+            continue
+        # IPs assigned to this interface
+        for ip_rec in data.get("ip_addresses", []):
+            assigned = ip_rec.get("assigned_object", {}) or {}
+            if assigned.get("id") == iface.get("id"):
+                addr = ip_rec.get("address", "").split("/")[0]
+                if addr:
+                    peer_ips.add(addr)
+
+    # Also include statically configured peers from config.yaml
+    for peer in bgp_cfg.get("static_peers", {}).get(hostname, []):
+        peer_ips.add(peer)
+
+    services = []
+    for peer_ip in sorted(peer_ips):
+        # Convert dotted-decimal IP to OID suffix (e.g. 10.0.0.1 → 10.0.0.1)
+        oid = f".1.3.6.1.2.1.15.3.1.2.{peer_ip}"
+        safe_peer = peer_ip.replace(".", "-")
+        services.append({
+            "hostname":    hostname,
+            "service":     f"BGP-PEER-{safe_peer}",
+            "check":       f"check_snmp!-C {community} -v {version} -o {oid} -e 6 -w 6:6 -c 6:6",
+            "description": f"BGP Peer {peer_ip} State",
+        })
+
+    return services
+
+
 # ---------------------------------------------------------------------------
 # Hostgroup builder
 # ---------------------------------------------------------------------------
@@ -437,6 +501,7 @@ def transform(data: dict, config: dict) -> dict:
             hosts.append(host)
             services.extend(_build_services(host, config))
             services.extend(_build_interface_services(host, data, config))
+            services.extend(_build_bgp_services(host, data, config))
 
     # --- VMs ---
     for vm in data["vms"]:
