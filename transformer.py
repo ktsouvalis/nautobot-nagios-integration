@@ -221,6 +221,44 @@ def _build_services(host: dict, config: dict) -> list:
 
     return services
 
+
+def _build_ssl_services(host: dict, config: dict) -> list:
+    """
+    Build SSL certificate expiry checks for NRPE hosts.
+
+    Uses check_http with -S --sni -C <warn_days>,<crit_days> which alerts
+    when the certificate expires within the threshold.  Runs directly from
+    the Nagios server (not via NRPE) against the host's address.
+
+    Ports to check are configured in ssl.ports (default: [443]).
+    Roles that should be checked are configured in ssl.check_roles.
+    """
+    ssl_cfg    = config.get("ssl", {})
+    check_roles = [r.lower() for r in ssl_cfg.get("check_roles", ["server", "hypervisor"])]
+    ports       = ssl_cfg.get("ports", [443])
+    warn_days   = ssl_cfg.get("warn_days", 30)
+    crit_days   = ssl_cfg.get("crit_days", 14)
+
+    if host["check_method"] != "nrpe":
+        return []
+    if not any(r in host["role"] for r in check_roles):
+        return []
+
+    hostname = host["hostname"]
+    address  = host["address"]
+    services = []
+
+    for port in ports:
+        services.append({
+            "hostname":    hostname,
+            "service":     f"SSL-CERT-{port}",
+            "check":       f"check_http!-H {address} -p {port} -S --sni -C {warn_days},{crit_days}",
+            "description": f"SSL Certificate Expiry (port {port})",
+        })
+
+    return services
+
+
 def _build_interface_services(host: dict, data: dict, config: dict) -> list:
     """Build SNMP interface services for SNMP-capable devices with ifIndex map."""
     if host["check_method"] != "snmp" or host["type"] != "device":
@@ -649,6 +687,7 @@ def transform(data: dict, config: dict) -> dict:
             services.extend(_build_bgp_services(host, data, config))
             services.extend(_build_ups_services(host, config))
             services.extend(_build_memory_services(host, config))
+            services.extend(_build_ssl_services(host, config))
 
     # --- VMs ---
     for vm in data["vms"]:
@@ -656,6 +695,7 @@ def transform(data: dict, config: dict) -> dict:
         if host:
             hosts.append(host)
             services.extend(_build_services(host, config))
+            services.extend(_build_ssl_services(host, config))
 
     # --- Parent-child topology ---
     hostname_by_device_id = {h["nautobot_id"]: h["hostname"] for h in hosts if h["type"] == "device"}

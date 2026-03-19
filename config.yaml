@@ -100,6 +100,24 @@ nrpe:
 
 
 # =============================================================================
+# SSL certificate expiry monitoring
+# =============================================================================
+ssl:
+  # Roles that should have SSL cert checks (must be nrpe check_method)
+  check_roles:
+    - "server"
+    - "hypervisor"
+
+  # TCP ports to check per host
+  ports:
+    - 443
+
+  # Alert when cert expires within N days
+  warn_days: 30
+  crit_days: 14
+
+
+# =============================================================================
 # UPS monitoring (RFC 1628 UPS-MIB via SNMP)
 # =============================================================================
 ups:
