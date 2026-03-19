@@ -160,6 +160,19 @@ bgp:
 
 
 # =============================================================================
+# Nautobot custom fields → Nagios directives
+# =============================================================================
+custom_fields:
+  # Custom field names to check (in order) for the Nagios notes_url directive.
+  # The first non-empty value found on a device/VM is used.
+  # Set the field value in Nautobot to a URL (e.g. your runbook or wiki page).
+  notes_url_fields:
+    - "nagios_notes_url"
+    - "runbook_url"
+    - "wiki_url"
+
+
+# =============================================================================
 # Maps configuration
 # =============================================================================
 maps:

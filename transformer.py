@@ -117,6 +117,25 @@ def _safe_hostname(name: str) -> str:
     return name.strip().replace(" ", "_").replace("/", "_").replace(":", "_")
 
 
+def _extract_notes_url(obj: dict, config: dict) -> str:
+    """
+    Read Nautobot custom_fields on a device or VM and return a notes_url value.
+
+    The field names to check are configured in config.yaml under
+    custom_fields.notes_url_fields (checked in order; first non-empty wins).
+    Defaults to ["nagios_notes_url", "runbook_url", "wiki_url"].
+    """
+    field_names = config.get("custom_fields", {}).get(
+        "notes_url_fields", ["nagios_notes_url", "runbook_url", "wiki_url"]
+    )
+    custom_fields = obj.get("custom_fields") or {}
+    for field in field_names:
+        value = custom_fields.get(field)
+        if value and isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 def _determine_check_method(role_slug: str, config: dict) -> str:
     """
     Determine monitoring method based on device role slug.
@@ -163,6 +182,7 @@ def _build_device_host(device: dict, data: dict, config: dict) -> dict | None:
         "type":         "device",
         "nautobot_id":  device["id"],
         "comments":     device.get("comments", ""),
+        "notes_url":    _extract_notes_url(device, config),
     }
 
 
@@ -192,6 +212,7 @@ def _build_vm_host(vm: dict, data: dict, config: dict) -> dict | None:
         "type":         "vm",
         "nautobot_id":  vm["id"],
         "comments":     vm.get("comments", ""),
+        "notes_url":    _extract_notes_url(vm, config),
     }
 
 

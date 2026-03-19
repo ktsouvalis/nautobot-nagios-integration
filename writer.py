@@ -63,6 +63,8 @@ def _render_host(host: dict, config: dict) -> str:
     ]
     if host.get("parents"):
         lines.append(f"    parents                 {host['parents']}")
+    if host.get("notes_url"):
+        lines.append(f"    notes_url               {host['notes_url']}")
     if host.get("comments"):
         lines.append(f"    notes                   {host['comments']}")
     lines.append("}")
