@@ -250,7 +250,7 @@ def _build_services(host: dict, config: dict) -> list:
                 "hostname":    hostname,
                 "service":     "SNMP-CPU",
                 "check":       f"check_snmp!{snmp_args} -o .1.3.6.1.4.1.9.2.1.58.0 -w 80 -c 90",
-                "description": "SNMP CPU Load (Cisco)",
+                "description": "SNMP CPU Load - Cisco",
             })
         services += snmp_services
 
@@ -312,7 +312,7 @@ def _build_ssl_services(host: dict, config: dict) -> list:
             "hostname":    hostname,
             "service":     f"SSL-CERT-{port}",
             "check":       f"check_http!-H {address} -p {port} -S --sni -C {warn_days},{crit_days}",
-            "description": f"SSL Certificate Expiry (port {port})",
+            "description": f"SSL Certificate Expiry port {port}",
         })
 
     return services
@@ -472,20 +472,20 @@ def _build_ups_services(host: dict, config: dict) -> list:
             # Trailing colon on -w/-c means "alert if below this value" (lower bound)
             # e.g. -w 15: → warn if minutes remaining < 15
             "check":       f"check_snmp!{snmp_args} -o .1.3.6.1.2.1.33.1.2.3.0 -w {warn_runtime}: -c {crit_runtime}:",
-            "description": "UPS Estimated Runtime (minutes)",
+            "description": "UPS Estimated Runtime minutes",
         },
         {
             "hostname":    hostname,
             "service":     "UPS-CHARGE",
             # Same lower-bound pattern: warn if charge drops below warn_charge_pct
             "check":       f"check_snmp!{snmp_args} -o .1.3.6.1.2.1.33.1.2.4.0 -w {warn_charge}: -c {crit_charge}:",
-            "description": "UPS Battery Charge (%)",
+            "description": "UPS Battery Charge pct",
         },
         {
             "hostname":    hostname,
             "service":     "UPS-OUTPUT-LOAD",
             "check":       f"check_snmp!{snmp_args} -o .1.3.6.1.2.1.33.1.4.4.1.5.1 -w {warn_load} -c {crit_load}",
-            "description": "UPS Output Load (%)",
+            "description": "UPS Output Load pct",
         },
     ]
 
@@ -538,7 +538,7 @@ def _build_memory_services(host: dict, config: dict) -> list:
                     f"-w {warn_free_bytes}: -c {crit_free_bytes}: "
                     f"-l 'Processor Pool Free (bytes)'"
                 ),
-                "description": "Memory Free (Cisco Processor Pool)",
+                "description": "Memory Free - Cisco Processor Pool",
             },
         ]
     else:
@@ -552,7 +552,7 @@ def _build_memory_services(host: dict, config: dict) -> list:
                     f"-o .1.3.6.1.2.1.25.2.3.1.6.1 "
                     f"-l 'RAM Used (allocation units)'"
                 ),
-                "description": "Memory Used (hrStorageUsed)",
+                "description": "Memory Used - hrStorageUsed",
             },
             {
                 "hostname":    hostname,
@@ -562,7 +562,7 @@ def _build_memory_services(host: dict, config: dict) -> list:
                     f"-o .1.3.6.1.2.1.25.2.3.1.5.1 "
                     f"-l 'RAM Size (allocation units)'"
                 ),
-                "description": "Memory Size (hrStorageSize)",
+                "description": "Memory Size - hrStorageSize",
             },
         ]
 
