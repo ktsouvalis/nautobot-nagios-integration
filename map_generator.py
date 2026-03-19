@@ -599,7 +599,7 @@ async function refreshStatus() {{
       }};
       const getRaw = (host, svc) => {{
         const s = svclist[host]?.[svc]?.long_plugin_output || '';
-        const m = s.match(/SNMP OK - (\d+)/);
+        const m = s.match(/SNMP OK - (\\d+)/);
         return m ? parseInt(m[1]) : null;
       }};
 
