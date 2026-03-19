@@ -83,6 +83,16 @@ snmp:
     - "switch"
     - "san"
 
+  # Memory monitoring thresholds
+  # Cisco ciscoMemoryPoolLargestFree OID returns bytes — thresholds in bytes
+  memory_skip_roles:
+    - "ups"
+    - "ip-phone"
+    - "voip-phone"
+    - "phone"
+  cisco_mem_warn_free_bytes: 10485760   # 10 MB
+  cisco_mem_crit_free_bytes: 4194304    #  4 MB
+
 
 nrpe:
   port: 5666

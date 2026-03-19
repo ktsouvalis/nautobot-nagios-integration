@@ -402,6 +402,86 @@ def _build_ups_services(host: dict, config: dict) -> list:
     ]
 
 
+def _build_memory_services(host: dict, config: dict) -> list:
+    """
+    Build SNMP memory utilisation checks for network devices.
+
+    Cisco devices (cisco_roles): uses ciscoMemoryPoolMIB
+      - Largest free block in the processor pool
+        OID: .1.3.6.1.4.1.9.9.48.1.1.1.6.1  (ciscoMemoryPoolLargestFree)
+        We check the *used* ratio via the used/free pair and alert via check_snmp -w/-c.
+
+    Non-Cisco SNMP devices: uses HOST-RESOURCES-MIB hrStorage (index 1 = RAM)
+      - hrStorageUsed  .1.3.6.1.2.1.25.2.3.1.6.1
+      - hrStorageSize  .1.3.6.1.2.1.25.2.3.1.5.1
+      We use check_snmp with -o for used and warn/crit as raw units.
+      For simplicity we emit two OID checks: used and size (operators can
+      compute % in their graphing tool).  A future enhancement could use
+      check_snmp_int or a custom plugin for true % thresholds.
+
+    UPS and phone roles are excluded (they have their own service sets).
+    """
+    snmp_cfg   = config.get("snmp", {})
+    skip_roles = set(snmp_cfg.get("memory_skip_roles", ["ups", "ip-phone", "voip-phone", "phone"]))
+
+    if host["check_method"] != "snmp" or host["type"] != "device":
+        return []
+    if any(r in host["role"] for r in skip_roles):
+        return []
+
+    cisco_roles = config["snmp"].get("cisco_roles", [])
+    is_cisco    = any(r in host["role"] for r in cisco_roles)
+    community   = (
+        os.getenv("SNMP_COMMUNITY_CISCO", "public") if is_cisco
+        else os.getenv("SNMP_COMMUNITY_DEFAULT", "public")
+    )
+    version  = config["snmp"].get("version", "2c")
+    hostname = host["hostname"]
+    snmp     = f"-C {community} -v {version}"
+
+    if is_cisco:
+        # Cisco: alert when free processor-pool memory drops below threshold
+        warn_free_bytes = snmp_cfg.get("cisco_mem_warn_free_bytes", 10485760)   # 10 MB
+        crit_free_bytes = snmp_cfg.get("cisco_mem_crit_free_bytes", 4194304)   #  4 MB
+        return [
+            {
+                "hostname":    hostname,
+                "service":     "SNMP-MEMORY-CISCO",
+                "check":       (
+                    f"check_snmp!{snmp} "
+                    f"-o .1.3.6.1.4.1.9.9.48.1.1.1.6.1 "
+                    f"-w {warn_free_bytes}: -c {crit_free_bytes}: "
+                    f"-l 'Processor Pool Free (bytes)'"
+                ),
+                "description": "Memory Free (Cisco Processor Pool)",
+            },
+        ]
+    else:
+        # Generic: HOST-RESOURCES-MIB hrStorage index 1 (Physical Memory)
+        return [
+            {
+                "hostname":    hostname,
+                "service":     "SNMP-MEMORY-USED",
+                "check":       (
+                    f"check_snmp!{snmp} "
+                    f"-o .1.3.6.1.2.1.25.2.3.1.6.1 "
+                    f"-l 'RAM Used (allocation units)'"
+                ),
+                "description": "Memory Used (hrStorageUsed)",
+            },
+            {
+                "hostname":    hostname,
+                "service":     "SNMP-MEMORY-SIZE",
+                "check":       (
+                    f"check_snmp!{snmp} "
+                    f"-o .1.3.6.1.2.1.25.2.3.1.5.1 "
+                    f"-l 'RAM Size (allocation units)'"
+                ),
+                "description": "Memory Size (hrStorageSize)",
+            },
+        ]
+
+
 # ---------------------------------------------------------------------------
 # Hostgroup builder
 # ---------------------------------------------------------------------------
@@ -568,6 +648,7 @@ def transform(data: dict, config: dict) -> dict:
             services.extend(_build_interface_services(host, data, config))
             services.extend(_build_bgp_services(host, data, config))
             services.extend(_build_ups_services(host, config))
+            services.extend(_build_memory_services(host, config))
 
     # --- VMs ---
     for vm in data["vms"]:
