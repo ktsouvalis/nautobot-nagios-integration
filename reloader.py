@@ -5,11 +5,11 @@ Connects to Nagios VM, runs nagios -v to validate, then reloads if clean.
 """
 
 import logging
-import os
 
-import paramiko
 import yaml
 from dotenv import load_dotenv
+
+from utils import get_ssh_client
 
 load_dotenv()
 
@@ -19,18 +19,6 @@ logger = logging.getLogger(__name__)
 def load_config(path: str = "config.yaml") -> dict:
     with open(path, "r") as f:
         return yaml.safe_load(f)
-
-
-def _get_ssh_client() -> paramiko.SSHClient:
-    host     = os.getenv("NAGIOS_SSH_HOST")
-    user     = os.getenv("NAGIOS_SSH_USER")
-    password = os.getenv("NAGIOS_SSH_PASSWORD")
-    port     = int(os.getenv("NAGIOS_SSH_PORT", 22))
-
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(hostname=host, port=port, username=user, password=password)
-    return client
 
 
 def _run(ssh: paramiko.SSHClient, cmd: str) -> tuple[int, str, str]:
@@ -50,7 +38,7 @@ def validate_and_reload(config: dict) -> bool:
     reload_cmd = config["nagios"]["reload_command"]
 
     logger.info("Connecting to Nagios VM for validation...")
-    ssh = _get_ssh_client()
+    ssh = get_ssh_client()
 
     try:
         # Step 1: Validate config

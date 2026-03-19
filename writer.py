@@ -13,9 +13,10 @@ import logging
 import os
 import tempfile
 
-import paramiko
 import yaml
 from dotenv import load_dotenv
+
+from utils import get_ssh_client
 
 load_dotenv()
 
@@ -31,27 +32,7 @@ def load_config(path: str = "config.yaml") -> dict:
         return yaml.safe_load(f)
 
 
-# ---------------------------------------------------------------------------
-# SSH/SCP client
-# ---------------------------------------------------------------------------
-
-def _get_ssh_client() -> paramiko.SSHClient:
-    host     = os.getenv("NAGIOS_SSH_HOST")
-    user     = os.getenv("NAGIOS_SSH_USER")
-    password = os.getenv("NAGIOS_SSH_PASSWORD")
-    port     = int(os.getenv("NAGIOS_SSH_PORT", 22))
-
-    if not all([host, user, password]):
-        raise EnvironmentError("NAGIOS_SSH_HOST, NAGIOS_SSH_USER, NAGIOS_SSH_PASSWORD must be set in .env")
-
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(hostname=host, port=port, username=user, password=password)
-    logger.debug(f"SSH connected to {user}@{host}:{port}")
-    return client
-
-
-def _scp_file(sftp: paramiko.SFTPClient, local_path: str, remote_path: str):
+def _scp_file(sftp, local_path: str, remote_path: str):
     """Upload a single file via SFTP."""
     sftp.put(local_path, remote_path)
     logger.debug(f"SCP: {local_path} → {remote_path}")
@@ -167,7 +148,7 @@ def write(result: dict, config: dict):
 
         # SCP to Nagios VM
         logger.info("Connecting to Nagios VM via SSH...")
-        ssh = _get_ssh_client()
+        ssh = get_ssh_client()
         try:
             sftp = ssh.open_sftp()
 
@@ -176,7 +157,7 @@ def write(result: dict, config: dict):
                 sftp.stat(remote_dir)
             except FileNotFoundError:
                 # mkdir -p via SSH
-                stdin, stdout, stderr = ssh.exec_command(f"sudo mkdir -p {remote_dir}")
+                _, stdout, _ = ssh.exec_command(f"sudo mkdir -p {remote_dir}")
                 stdout.channel.recv_exit_status()
 
             for fname, local_path in local_files.items():
