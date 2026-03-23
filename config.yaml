@@ -50,6 +50,9 @@ nagios:
   # Path to Nagios status.dat (for live map data)
   status_dat: "/usr/local/nagios/var/status.dat"
 
+  # Path to Nagios plugins directory (libexec)
+  nagios_libexec: "/usr/local/nagios/libexec"
+
   # Path to nagios binary (for config validation)
   nagios_bin: "/usr/local/nagios/bin/nagios"
 
@@ -83,10 +86,135 @@ snmp:
     - "switch"
     - "san"
 
+  # Roles that use SNMPv3 instead of v2c (credentials come from .env)
+  # Leave empty to use v2c for all roles
+  v3_roles: []
+
+  # Memory monitoring thresholds
+  # Cisco ciscoMemoryPoolLargestFree OID returns bytes — thresholds in bytes
+  memory_skip_roles:
+    - "ups"
+    - "ip-phone"
+    - "voip-phone"
+    - "phone"
+    - "router"
+    - "firewall"
+    - "access-point"
+  cisco_mem_warn_free_bytes: 10485760   # 10 MB
+  cisco_mem_crit_free_bytes: 4194304    #  4 MB
+
+  # Devices whose SNMP ifDescr uses "Unit: X Slot: Y Port: Z Type - Level" format
+  # instead of standard Cisco-style names (GigabitEthernet1/0/1).
+  # List the Nagios hostname (case-insensitive) of each such device.
+  unit_slot_port_devices:
+    - "AALHOUSE-SWITCH-3"
+
+  # check_snmp_int bandwidth thresholds (bytes/sec, applied to both in and out).
+  # Defaults are intentionally very high so the check only alerts on interface
+  # down (ifOperStatus), not on bandwidth saturation.  Lower these if you want
+  # bandwidth alerts (e.g. 100000000 = 100 MB/s warn on a GigabitEthernet).
+  int_warn_bps: 999999999
+  int_crit_bps: 999999999
+
 
 nrpe:
   port: 5666
   timeout: 30
+
+
+# =============================================================================
+# SSL certificate expiry monitoring
+# =============================================================================
+ssl:
+  # Roles that should have SSL cert checks (must be nrpe check_method)
+  check_roles:
+    - "server"
+    - "hypervisor"
+
+  # TCP ports to check per host
+  ports:
+    - 443
+
+  # Alert when cert expires within N days
+  warn_days: 30
+  crit_days: 14
+
+
+# =============================================================================
+# UPS monitoring (RFC 1628 UPS-MIB via SNMP)
+# =============================================================================
+ups:
+  # Roles that should have UPS-MIB checks generated
+  ups_roles:
+    - "ups"
+
+  # Runtime thresholds (minutes remaining on battery)
+  warn_runtime_minutes: 15
+  crit_runtime_minutes: 5
+
+  # Charge thresholds (% remaining)
+  warn_charge_pct: 50
+  crit_charge_pct: 20
+
+  # Output load thresholds (% of rated capacity)
+  warn_load_pct: 80
+  crit_load_pct: 95
+
+
+# =============================================================================
+# BGP monitoring
+# =============================================================================
+bgp:
+  # Roles that should have BGP peer checks generated
+  router_roles:
+    - "router"
+
+  # Static peer IPs per hostname (for peers not discoverable via Nautobot
+  # interface descriptions containing "bgp")
+  # static_peers:
+  #   my-router-01:
+  #     - "192.0.2.1"
+  #     - "192.0.2.2"
+  static_peers: {}
+
+
+# =============================================================================
+# Nautobot custom fields → Nagios directives
+# =============================================================================
+custom_fields:
+  # Custom field names to check (in order) for the Nagios notes_url directive.
+  # The first non-empty value found on a device/VM is used.
+  # Set the field value in Nautobot to a URL (e.g. your runbook or wiki page).
+  notes_url_fields:
+    - "nagios_notes_url"
+    - "runbook_url"
+    - "wiki_url"
+
+
+# =============================================================================
+# Hostgroup category overrides
+# Each entry creates a named hostgroup collecting devices whose role matches
+# any slug in the roles list.  VMs always get their own "all-vms" group.
+# =============================================================================
+hostgroups:
+  network-devices:
+    alias: "Network Devices"
+    roles:
+      - "switch"
+      - "router"
+      - "firewall"
+      - "access-point"
+  servers:
+    alias: "Servers"
+    roles:
+      - "server"
+      - "kvm"
+      - "hypervisor"
+  storage:
+    alias: "Storage"
+    roles:
+      - "nas"
+      - "san"
 
 
 # =============================================================================
@@ -104,7 +232,7 @@ maps:
   phone_map: "phone-map.html"
   hosts_map: "hosts-map.html"
 
-# Roles per map
+  # Roles per map
   network_roles:
     - "switch"
     - "router"

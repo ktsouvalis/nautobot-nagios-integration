@@ -11,9 +11,57 @@ Uses field names confirmed from live Nautobot 2.x API output.
 
 import logging
 import os
-from utils import normalize_ifname
+import re
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# SNMP auth helper
+# ---------------------------------------------------------------------------
+
+def _snmp_auth_args(role: str, config: dict, for_snmp_int: bool = False) -> str:
+    """
+    Return SNMP authentication CLI args for a given device role.
+
+    for_snmp_int=False (default) → check_snmp plugin flags:
+      SNMPv3: -U (uppercase) for username; v2c: -P <version>
+    for_snmp_int=True → check_snmp_int.pl (manubulon) plugin flags:
+      SNMPv3: -u (lowercase) for username; v2c: -2 (manubulon -v means verbose)
+
+    Credentials are read from env vars:
+      SNMP_V3_USER, SNMP_V3_SEC_LEVEL, SNMP_V3_AUTH_PROTO, SNMP_V3_AUTH_PASS,
+      SNMP_V3_PRIV_PROTO, SNMP_V3_PRIV_PASS, SNMP_COMMUNITY_CISCO,
+      SNMP_COMMUNITY_DEFAULT
+    """
+    snmp_cfg    = config.get("snmp", {})
+    v3_roles    = [r.lower() for r in snmp_cfg.get("v3_roles", [])]
+    cisco_roles = [r.lower() for r in snmp_cfg.get("cisco_roles", [])]
+
+    if v3_roles and any(r in role for r in v3_roles):
+        user       = os.getenv("SNMP_V3_USER", "nagios")
+        sec_level  = os.getenv("SNMP_V3_SEC_LEVEL", "authPriv")
+        auth_proto = os.getenv("SNMP_V3_AUTH_PROTO", "SHA")
+        auth_pass  = os.getenv("SNMP_V3_AUTH_PASS", "")
+        priv_proto = os.getenv("SNMP_V3_PRIV_PROTO", "AES")
+        priv_pass  = os.getenv("SNMP_V3_PRIV_PASS", "")
+        u_flag = "-u" if for_snmp_int else "-U"
+        return (
+            f"-v 3 -l {sec_level} {u_flag} {user} "
+            f"-a {auth_proto} -A {auth_pass} "
+            f"-x {priv_proto} -X {priv_pass}"
+        )
+
+    community = (
+        os.getenv("SNMP_COMMUNITY_CISCO", "public")
+        if any(r in role for r in cisco_roles)
+        else os.getenv("SNMP_COMMUNITY_DEFAULT", "public")
+    )
+    if for_snmp_int:
+        version = snmp_cfg.get("version", "2c")
+        return f"-C {community} -2" if version == "2c" else f"-C {community}"
+    version = snmp_cfg.get("version", "2c")
+    return f"-C {community} -P {version}"
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +123,25 @@ def _safe_hostname(name: str) -> str:
     return name.strip().replace(" ", "_").replace("/", "_").replace(":", "_")
 
 
+def _extract_notes_url(obj: dict, config: dict) -> str:
+    """
+    Read Nautobot custom_fields on a device or VM and return a notes_url value.
+
+    The field names to check are configured in config.yaml under
+    custom_fields.notes_url_fields (checked in order; first non-empty wins).
+    Defaults to ["nagios_notes_url", "runbook_url", "wiki_url"].
+    """
+    field_names = config.get("custom_fields", {}).get(
+        "notes_url_fields", ["nagios_notes_url", "runbook_url", "wiki_url"]
+    )
+    custom_fields = obj.get("custom_fields") or {}
+    for field in field_names:
+        value = custom_fields.get(field)
+        if value and isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 def _determine_check_method(role_slug: str, config: dict) -> str:
     """
     Determine monitoring method based on device role slug.
@@ -121,6 +188,7 @@ def _build_device_host(device: dict, data: dict, config: dict) -> dict | None:
         "type":         "device",
         "nautobot_id":  device["id"],
         "comments":     device.get("comments", ""),
+        "notes_url":    _extract_notes_url(device, config),
     }
 
 
@@ -150,6 +218,7 @@ def _build_vm_host(vm: dict, data: dict, config: dict) -> dict | None:
         "type":         "vm",
         "nautobot_id":  vm["id"],
         "comments":     vm.get("comments", ""),
+        "notes_url":    _extract_notes_url(vm, config),
     }
 
 
@@ -160,14 +229,9 @@ def _build_vm_host(vm: dict, data: dict, config: dict) -> dict | None:
 def _build_services(host: dict, config: dict) -> list:
     """Build Nagios service dicts for a host based on its check_method."""
     services = []
-    hostname = host["hostname"]
+    hostname    = host["hostname"]
     cisco_roles = config["snmp"].get("cisco_roles", [])
-    if any(r in host["role"] for r in cisco_roles):
-        snmp_community = os.getenv("SNMP_COMMUNITY_CISCO", "public")
-    else:
-        snmp_community = os.getenv("SNMP_COMMUNITY_DEFAULT", "public")
-    snmp_version   = config["snmp"].get("version", "2c")
-    nrpe_port      = config["nrpe"].get("port", 5666)
+    snmp_args   = _snmp_auth_args(host["role"], config)
 
     # Every host gets a ping check
     services.append({
@@ -178,113 +242,404 @@ def _build_services(host: dict, config: dict) -> list:
     })
 
     if host["check_method"] == "snmp" and host["type"] != "vm":
-        services += [
+        snmp_services = [
             {
                 "hostname":    hostname,
                 "service":     "SNMP-UPTIME",
-                "check":       f"check_snmp!-C {snmp_community} -v {snmp_version} -o .1.3.6.1.2.1.1.3.0",
+                "check":       f"check_snmp!{snmp_args} -o .1.3.6.1.2.1.1.3.0",
                 "description": "SNMP Uptime",
             },
-            {
+        ]
+        # Cisco-specific CPU OID — only for cisco_roles
+        if any(r in host["role"] for r in cisco_roles):
+            snmp_services.append({
                 "hostname":    hostname,
                 "service":     "SNMP-CPU",
-                "check":       f"check_snmp!-C {snmp_community} -v {snmp_version} -o .1.3.6.1.4.1.9.2.1.58.0 -w 80 -c 90",
-                "description": "SNMP CPU Load Cisco",
-            },
-        ]
+                "check":       f"check_snmp!{snmp_args} -o .1.3.6.1.4.1.9.2.1.58.0 -w 80 -c 90",
+                "description": "SNMP CPU Load - Cisco",
+            })
+        services += snmp_services
 
     elif host["check_method"] == "nrpe":
+        # check_nrpe uses $HOSTADDRESS$ and port from the command definition;
+        # we pass only the NRPE command name as $ARG1$
         services += [
             {
                 "hostname":    hostname,
                 "service":     "NRPE-CPU",
-                "check":       f"check_nrpe!-H {host['address']} -p {nrpe_port} -c check_load",
+                "check":       "check_nrpe!check_load",
                 "description": "CPU Load NRPE",
             },
             {
                 "hostname":    hostname,
                 "service":     "NRPE-DISK",
-                "check":       f"check_nrpe!-H {host['address']} -p {nrpe_port} -c check_disk",
+                "check":       "check_nrpe!check_disk",
                 "description": "Disk Usage NRPE",
             },
             {
                 "hostname":    hostname,
                 "service":     "NRPE-MEMORY",
-                "check":       f"check_nrpe!-H {host['address']} -p {nrpe_port} -c check_mem",
+                "check":       "check_nrpe!check_mem",
                 "description": "Memory Usage NRPE",
             },
         ]
 
     return services
 
+
+def _build_ssl_services(host: dict, config: dict) -> list:
+    """
+    Build SSL certificate expiry checks for NRPE hosts.
+
+    Uses check_http with -S --sni -C <warn_days>,<crit_days> which alerts
+    when the certificate expires within the threshold.  Runs directly from
+    the Nagios server (not via NRPE) against the host's address.
+
+    Ports to check are configured in ssl.ports (default: [443]).
+    Roles that should be checked are configured in ssl.check_roles.
+    """
+    ssl_cfg    = config.get("ssl", {})
+    check_roles = [r.lower() for r in ssl_cfg.get("check_roles", ["server", "hypervisor"])]
+    ports       = ssl_cfg.get("ports", [443])
+    warn_days   = ssl_cfg.get("warn_days", 30)
+    crit_days   = ssl_cfg.get("crit_days", 14)
+
+    if host["check_method"] != "nrpe":
+        return []
+    if not any(r in host["role"] for r in check_roles):
+        return []
+
+    hostname = host["hostname"]
+    address  = host["address"]
+    services = []
+
+    for port in ports:
+        services.append({
+            "hostname":    hostname,
+            "service":     f"SSL-CERT-{port}",
+            "check":       f"check_http!-H {address} -p {port} -S --sni -C {warn_days},{crit_days}",
+            "description": f"SSL Certificate Expiry port {port}",
+        })
+
+    return services
+
+
+def _ifname_to_snmp_filter(ifname: str, hostname: str, config: dict) -> str:
+    """
+    Return the check_snmp_int -n filter string for an interface.
+
+    Most devices (Cisco etc.) expose ifDescr matching the Nautobot name directly,
+    so the name is returned as-is.
+
+    Some vendors (e.g. D-Link) use "Unit: X Slot: Y Port: Z Type - Level" in
+    ifDescr.  List those device hostnames in snmp.unit_slot_port_devices and this
+    function will convert GigabitEthernetU/S/P → "Unit: U Slot: S Port: P Gigabit",
+    TenGigabitEthernetU/S/P → "Unit: U Slot: S Port: P 10G",
+    Port-channelN → "Link Aggregate N".
+    """
+    usp_devices = [d.upper() for d in config.get("snmp", {}).get("unit_slot_port_devices", [])]
+    if hostname.upper() not in usp_devices:
+        return ifname
+
+    m = re.match(r"^(GigabitEthernet|TenGigabitEthernet|FastEthernet)(\d+)/(\d+)/(\d+)$", ifname)
+    if m:
+        prefix, unit, slot, port = m.group(1), m.group(2), m.group(3), m.group(4)
+        type_str = {"GigabitEthernet": "Gigabit", "TenGigabitEthernet": "10G", "FastEthernet": "Fast Ethernet"}.get(prefix, prefix)
+        return f"Unit: {unit} Slot: {slot} Port: {port} {type_str}"
+
+    m = re.match(r"^[Pp]ort-channel(\d+)$", ifname)
+    if m:
+        return f"Link Aggregate {m.group(1)}"
+
+    return ifname
+
+
 def _build_interface_services(host: dict, data: dict, config: dict) -> list:
-    """Build SNMP interface services for SNMP-capable devices with ifIndex map."""
+    """
+    Build check_snmp_int interface services for SNMP-capable devices.
+
+    Uses check_snmp_int.pl (manubulon) instead of raw check_snmp, which gives:
+    - Automatic ifIndex resolution by interface name (no pre-walk needed)
+    - On-disk state storage (-k) so the plugin computes bytes/sec internally
+    - Performance data output (-f): traffic_in=<bytes/s>B/s traffic_out=<bytes/s>B/s
+
+    One service per interface replaces the former STATUS + IN + OUT triple.
+    The service alerts CRITICAL if ifOperStatus is not Up (replaces STATUS check)
+    and emits traffic rates for the network map tooltip (replaces IN/OUT checks).
+    """
     if host["check_method"] != "snmp" or host["type"] != "device":
         return []
 
+    device_id  = host["nautobot_id"]
+    interfaces = data.get("_interfaces_by_device", {}).get(device_id, [])
+    if not interfaces:
+        return []
+
+    snmp_args = _snmp_auth_args(host["role"], config, for_snmp_int=True)
+    hostname  = host["hostname"]
+    services  = []
+    # Bandwidth thresholds (bytes/sec, in and out).  Defaults are set very high
+    # so the check only alerts on interface down, not on bandwidth saturation.
+    warn_bps  = config["snmp"].get("int_warn_bps", 999999999)
+    crit_bps  = config["snmp"].get("int_crit_bps", 999999999)
+
+    for iface in interfaces:
+        ifname = iface.get("name", "")
+        if not ifname:
+            continue
+
+        snmp_filter = _ifname_to_snmp_filter(ifname, hostname, config)
+        safe_name = ifname.replace("/", "-").replace(" ", "_")
+        # Anchor the regex so "Gi1/0/2" doesn't also match "Gi1/0/20", "Gi1/0/21" etc.
+        snmp_regex = f"^{snmp_filter}$"
+        services.append({
+            "hostname":    hostname,
+            "service":     f"IFACE-{safe_name}",
+            "check":       f"check_snmp_int!{snmp_args} -n {snmp_regex} -k -f -w {warn_bps},{warn_bps} -c {crit_bps},{crit_bps}",
+            "description": f"Interface {ifname} Traffic",
+        })
+
+    return services
+
+
+def _build_bgp_services(host: dict, data: dict, config: dict) -> list:
+    """
+    Build BGP peer state checks for router-role SNMP devices.
+
+    Uses BGP4-MIB::bgpPeerState (.1.3.6.1.2.1.15.3.1.2.<peer_ip_as_oid>).
+    State 6 = Established; anything else is a problem.
+
+    Peer IPs are pulled from Nautobot IP addresses whose assigned interface
+    belongs to this device and whose description matches 'bgp' (case-insensitive),
+    supplemented by any statically configured peers in config.yaml under
+    bgp.static_peers[hostname].
+    """
+    bgp_cfg = config.get("bgp", {})
+    router_roles = [r.lower() for r in bgp_cfg.get("router_roles", ["router"])]
+
+    if host["check_method"] != "snmp" or host["type"] != "device":
+        return []
+    if not any(r in host["role"] for r in router_roles):
+        return []
+
+    snmp_args = _snmp_auth_args(host["role"], config)
+    hostname  = host["hostname"]
     device_id = host["nautobot_id"]
-    ifindex_map = data.get("_ifindex_map", {}).get(device_id)
-    if not ifindex_map:
+
+    # Collect peer IPs: from Nautobot IPs on this device's interfaces
+    peer_ips = set()
+    for iface in data.get("_interfaces_by_device", {}).get(device_id, []):
+        desc = (iface.get("description") or "").lower()
+        if "bgp" not in desc:
+            continue
+        # IPs assigned to this interface
+        for ip_rec in data.get("ip_addresses", []):
+            assigned = ip_rec.get("assigned_object", {}) or {}
+            if assigned.get("id") == iface.get("id"):
+                addr = ip_rec.get("address", "").split("/")[0]
+                if addr:
+                    peer_ips.add(addr)
+
+    # Also include statically configured peers from config.yaml
+    for peer in bgp_cfg.get("static_peers", {}).get(hostname, []):
+        peer_ips.add(peer)
+
+    services = []
+    for peer_ip in sorted(peer_ips):
+        # BGP4-MIB bgpPeerState OID suffix is the peer IP in dotted-decimal notation.
+        # e.g. peer 10.0.0.1 → OID .1.3.6.1.2.1.15.3.1.2.10.0.0.1
+        oid = f".1.3.6.1.2.1.15.3.1.2.{peer_ip}"
+        safe_peer = peer_ip.replace(".", "-")
+        # check_snmp flag meanings:
+        #   -e 6        → expected string/value is "6" (Established state)
+        #   -w 6:6      → warn if value outside range [6,6] (i.e. anything != 6)
+        #   -c 6:6      → crit under same condition (we skip warning, go straight to critical)
+        # BGP peer state integers: 1=Idle, 2=Connect, 3=Active, 4=OpenSent, 5=OpenConfirm, 6=Established
+        services.append({
+            "hostname":    hostname,
+            "service":     f"BGP-PEER-{safe_peer}",
+            "check":       f"check_snmp!{snmp_args} -o {oid} -e 6 -w 6:6 -c 6:6",
+            "description": f"BGP Peer {peer_ip} State",
+        })
+
+    return services
+
+
+def _build_ups_services(host: dict, config: dict) -> list:
+    """
+    Build UPS-MIB SNMP checks for UPS-role devices (RFC 1628).
+
+    Checks:
+      - Battery status      upsBatteryStatus (.1.3.6.1.2.1.33.1.2.1.0)
+                            1=unknown, 2=batteryNormal, 3=batteryLow, 4=batteryDepleted
+      - Estimated runtime   upsEstimatedMinutesRemaining (.1.3.6.1.2.1.33.1.2.3.0)
+      - Battery charge %    upsEstimatedChargeRemaining (.1.3.6.1.2.1.33.1.2.4.0)
+      - Output load %       upsOutputPercentLoad (.1.3.6.1.2.1.33.1.4.4.1.5.1)
+    """
+    ups_roles = [r.lower() for r in config.get("ups", {}).get("ups_roles", ["ups"])]
+
+    if host["check_method"] != "snmp" or host["type"] != "device":
+        return []
+    if not any(r in host["role"] for r in ups_roles):
+        return []
+
+    snmp_args = _snmp_auth_args(host["role"], config)
+    hostname  = host["hostname"]
+
+    ups_cfg          = config.get("ups", {})
+    warn_runtime     = ups_cfg.get("warn_runtime_minutes", 15)
+    crit_runtime     = ups_cfg.get("crit_runtime_minutes", 5)
+    warn_charge      = ups_cfg.get("warn_charge_pct", 50)
+    crit_charge      = ups_cfg.get("crit_charge_pct", 20)
+    warn_load        = ups_cfg.get("warn_load_pct", 80)
+    crit_load        = ups_cfg.get("crit_load_pct", 95)
+
+    return [
+        {
+            "hostname":    hostname,
+            "service":     "UPS-BATTERY-STATUS",
+            # upsBatteryStatus: 1=unknown, 2=batteryNormal, 3=batteryLow, 4=batteryDepleted
+            # -e 2 / -w 2:2 / -c 2:2 → only value 2 (Normal) is OK
+            "check":       f"check_snmp!{snmp_args} -o .1.3.6.1.2.1.33.1.2.1.0 -e 2 -w 2:2 -c 2:2",
+            "description": "UPS Battery Status",
+        },
+        {
+            "hostname":    hostname,
+            "service":     "UPS-RUNTIME",
+            # Trailing colon on -w/-c means "alert if below this value" (lower bound)
+            # e.g. -w 15: → warn if minutes remaining < 15
+            "check":       f"check_snmp!{snmp_args} -o .1.3.6.1.2.1.33.1.2.3.0 -w {warn_runtime}: -c {crit_runtime}:",
+            "description": "UPS Estimated Runtime minutes",
+        },
+        {
+            "hostname":    hostname,
+            "service":     "UPS-CHARGE",
+            # Same lower-bound pattern: warn if charge drops below warn_charge_pct
+            "check":       f"check_snmp!{snmp_args} -o .1.3.6.1.2.1.33.1.2.4.0 -w {warn_charge}: -c {crit_charge}:",
+            "description": "UPS Battery Charge pct",
+        },
+        {
+            "hostname":    hostname,
+            "service":     "UPS-OUTPUT-LOAD",
+            "check":       f"check_snmp!{snmp_args} -o .1.3.6.1.2.1.33.1.4.4.1.5.1 -w {warn_load} -c {crit_load}",
+            "description": "UPS Output Load pct",
+        },
+    ]
+
+
+def _build_memory_services(host: dict, config: dict) -> list:
+    """
+    Build SNMP memory utilisation checks for network devices.
+
+    Cisco devices (cisco_roles): uses ciscoMemoryPoolMIB
+      - Largest free block in the processor pool
+        OID: .1.3.6.1.4.1.9.9.48.1.1.1.6.1  (ciscoMemoryPoolLargestFree)
+        We check the *used* ratio via the used/free pair and alert via check_snmp -w/-c.
+
+    Non-Cisco SNMP devices: uses HOST-RESOURCES-MIB hrStorage (index 1 = RAM)
+      - hrStorageUsed  .1.3.6.1.2.1.25.2.3.1.6.1
+      - hrStorageSize  .1.3.6.1.2.1.25.2.3.1.5.1
+      We use check_snmp with -o for used and warn/crit as raw units.
+      For simplicity we emit two OID checks: used and size (operators can
+      compute % in their graphing tool).  A future enhancement could use
+      check_snmp_int or a custom plugin for true % thresholds.
+
+    UPS and phone roles are excluded (they have their own service sets).
+    """
+    snmp_cfg   = config.get("snmp", {})
+    skip_roles = set(snmp_cfg.get("memory_skip_roles", ["ups", "ip-phone", "voip-phone", "phone"]))
+
+    if host["check_method"] != "snmp" or host["type"] != "device":
+        return []
+    if any(r in host["role"] for r in skip_roles):
         return []
 
     cisco_roles = config["snmp"].get("cisco_roles", [])
-    community = (
-        os.getenv("SNMP_COMMUNITY_CISCO", "public")
-        if any(r in host["role"] for r in cisco_roles)
-        else os.getenv("SNMP_COMMUNITY_DEFAULT", "public")
-    )
-    version = config["snmp"].get("version", "2c")
-    hostname = host["hostname"]
-    services = []
+    is_cisco    = any(r in host["role"] for r in cisco_roles)
+    snmp_args   = _snmp_auth_args(host["role"], config)
+    hostname    = host["hostname"]
 
-    interfaces = data.get("_interfaces_by_device", {}).get(device_id, [])
-    for iface in interfaces:
-        ifname = iface.get("name", "")
-        ifindex = ifindex_map.get(ifname) or ifindex_map.get(normalize_ifname(ifname))
-        if ifindex is None:
-            continue
-
-        safe_name = ifname.replace("/", "-").replace(" ", "_")
-
-        services += [
+    if is_cisco:
+        # Cisco ciscoMemoryPoolLargestFree OID returns bytes (not KB, not KB×1024).
+        # Thresholds must be set in bytes; 10 MB = 10 485 760, 4 MB = 4 194 304.
+        # We alert when free bytes drop BELOW the threshold (hence trailing colon: -w N:).
+        warn_free_bytes = snmp_cfg.get("cisco_mem_warn_free_bytes", 10485760)   # 10 MB
+        crit_free_bytes = snmp_cfg.get("cisco_mem_crit_free_bytes", 4194304)   #  4 MB
+        return [
             {
                 "hostname":    hostname,
-                "service":     f"IFACE-{safe_name}-STATUS",
-                "check":       f"check_snmp!-C {community} -v {version} -o .1.3.6.1.2.1.2.2.1.8.{ifindex} -w 1:1 -c 1:1",
-                "description": f"Interface {ifname} Status",
+                "service":     "SNMP-MEMORY-CISCO",
+                "check":       (
+                    f"check_snmp!{snmp_args} "
+                    f"-o .1.3.6.1.4.1.9.9.48.1.1.1.6.1 "
+                    f"-w {warn_free_bytes}: -c {crit_free_bytes}: "
+                    f"-l 'Processor Pool Free (bytes)'"
+                ),
+                "description": "Memory Free - Cisco Processor Pool",
+            },
+        ]
+    else:
+        # Generic: HOST-RESOURCES-MIB hrStorage index 1 (Physical Memory)
+        return [
+            {
+                "hostname":    hostname,
+                "service":     "SNMP-MEMORY-USED",
+                "check":       (
+                    f"check_snmp!{snmp_args} "
+                    f"-o .1.3.6.1.2.1.25.2.3.1.6.1 "
+                    f"-l 'RAM Used (allocation units)'"
+                ),
+                "description": "Memory Used - hrStorageUsed",
             },
             {
                 "hostname":    hostname,
-                "service":     f"IFACE-{safe_name}-IN",
-                "check":       f"check_snmp!-C {community} -v {version} -o .1.3.6.1.2.1.2.2.1.10.{ifindex}",
-                "description": f"Interface {ifname} In Octets",
-            },
-            {
-                "hostname":    hostname,
-                "service":     f"IFACE-{safe_name}-OUT",
-                "check":       f"check_snmp!-C {community} -v {version} -o .1.3.6.1.2.1.2.2.1.16.{ifindex}",
-                "description": f"Interface {ifname} Out Octets",
+                "service":     "SNMP-MEMORY-SIZE",
+                "check":       (
+                    f"check_snmp!{snmp_args} "
+                    f"-o .1.3.6.1.2.1.25.2.3.1.5.1 "
+                    f"-l 'RAM Size (allocation units)'"
+                ),
+                "description": "Memory Size - hrStorageSize",
             },
         ]
 
-    return services
 
 # ---------------------------------------------------------------------------
 # Hostgroup builder
 # ---------------------------------------------------------------------------
 
-def _build_hostgroups(hosts: list) -> dict:
+def _build_hostgroups(hosts: list, config: dict = None) -> dict:
     """
     Build hostgroup dicts from host list.
     Groups by: role, location (devices), cluster (VMs), type (devices/vms/phones)
+    Also builds named category groups from hostgroups config (e.g. network-devices, servers, storage).
     Returns dict of { hostgroup_name: { name, alias, members[] } }
     """
     groups = {}
+    config = config or {}
 
     def _add(group_name: str, alias: str, hostname: str):
         if group_name not in groups:
             groups[group_name] = {"name": group_name, "alias": alias, "members": []}
         groups[group_name]["members"].append(hostname)
+
+    # Build category lookup: role_slug -> (group_name, alias)
+    category_by_role = {}
+    for group_name, cfg in config.get("hostgroups", {}).items():
+        alias = cfg.get("alias", group_name.replace("-", " ").title())
+        for r in cfg.get("roles", []):
+            category_by_role[r.lower()] = (group_name, alias)
+
+    # Compute these once — used to decide whether location/cluster groups are meaningful
+    location_names = {
+        h.get("location") for h in hosts
+        if h.get("type") == "device" and h.get("location") and h.get("location") != "unknown"
+    }
+    cluster_names = {
+        h.get("cluster") for h in hosts
+        if h.get("type") == "vm" and h.get("cluster") and h.get("cluster") != "unknown"
+    }
+    phone_roles = {"ip-phone", "voip-phone", "phone"}
 
     for host in hosts:
         hostname = host["hostname"]
@@ -295,22 +650,29 @@ def _build_hostgroups(hosts: list) -> dict:
         if htype == "device":
             _add("all-devices", "All Physical Devices", hostname)
         elif htype == "vm":
-            _add("all-vms", "All Virtual Machines", hostname)
+            _add("vms", "VMs", hostname)
+
+        # Named category groups (network-devices, servers, storage, …)
+        if role and role != "unknown":
+            for cat_role, (group_name, alias) in category_by_role.items():
+                if cat_role in role:
+                    _add(group_name, alias, hostname)
+                    break
 
         # Group by role
         if role and role != "unknown":
-            _add(f"role-{role}", f"Role: {role.title()}", hostname)
+            _add(f"{role}", f"Role: {role.title()}", hostname)
 
-        # Group by location (devices)
-        location_names = set(h.get("location") for h in hosts if h.get("type") == "device" and h.get("location") and h.get("location") != "unknown")
+        # Location groups are only useful when devices span more than one site.
+        # A single-location deployment would get a group of all devices which is
+        # redundant with "all-devices", so we suppress it.
         if len(location_names) > 1:
             location = host.get("location")
             if location and location != "unknown":
                 loc_slug = location.lower().replace(" ", "-")
                 _add(f"location-{loc_slug}", f"Location: {location}", hostname)
 
-        # Group by cluster (VMs)
-        cluster_names = set(h.get("cluster") for h in hosts if h.get("type") == "vm" and h.get("cluster") and h.get("cluster") != "unknown")
+        # Same rationale for cluster groups — omit if all VMs are in the same cluster.
         if len(cluster_names) > 1:
             cluster = host.get("cluster")
             if cluster and cluster != "unknown":
@@ -318,12 +680,90 @@ def _build_hostgroups(hosts: list) -> dict:
                 _add(f"cluster-{cluster_slug}", f"Cluster: {cluster}", hostname)
 
         # Phone group
-        role_slug = host.get("role", "")
-        phone_roles = ["ip-phone", "voip-phone", "phone"]
-        if any(p in role_slug for p in phone_roles):
+        if any(p in role for p in phone_roles):
             _add("all-phones", "All IP Phones", hostname)
 
     return groups
+
+
+# ---------------------------------------------------------------------------
+# Parent-child topology builder
+# ---------------------------------------------------------------------------
+
+def _build_parent_map(data: dict, hostname_by_device_id: dict) -> dict:
+    """
+    Parse cable data to build { child_hostname: parent_hostname } mapping.
+
+    Logic: for each cable, the device with the higher-priority role
+    (router > firewall > switch > other) is the parent.  If both ends
+    are the same role tier, the one whose interface name sorts first is
+    treated as parent (deterministic but arbitrary).
+
+    Only physical device-to-device cables are considered; VM and
+    unresolvable endpoints are skipped.
+    """
+    ROLE_TIER = {"router": 0, "firewall": 1, "switch": 2}
+    roles_by_id = data.get("_roles_by_id", {})
+
+    def _tier(device_id: str) -> int:
+        # Find the device and resolve its role tier
+        for dev in data.get("devices", []):
+            if dev["id"] == device_id:
+                role_obj = dev.get("role", {})
+                role_id  = role_obj.get("id") if role_obj else None
+                role     = roles_by_id.get(role_id, {}).get("name", "").lower().replace(" ", "-") if role_id else ""
+                for key, t in ROLE_TIER.items():
+                    if key in role:
+                        return t
+                return 99
+        return 99
+
+    parent_map = {}  # { child_hostname: parent_hostname }
+
+    for cable in data.get("cables", []):
+        # Nautobot 2.x cable terminations
+        a_terms = cable.get("a_terminations", [])
+        b_terms = cable.get("b_terminations", [])
+        if not a_terms or not b_terms:
+            continue
+
+        a = a_terms[0]
+        b = b_terms[0]
+
+        # Only device interfaces (not circuits, console ports, etc.)
+        if a.get("object_type") != "dcim.interface" or b.get("object_type") != "dcim.interface":
+            continue
+
+        a_dev_id = a.get("object", {}).get("device", {}).get("id")
+        b_dev_id = b.get("object", {}).get("device", {}).get("id")
+
+        if not a_dev_id or not b_dev_id or a_dev_id == b_dev_id:
+            continue
+
+        a_host = hostname_by_device_id.get(a_dev_id)
+        b_host = hostname_by_device_id.get(b_dev_id)
+        if not a_host or not b_host:
+            continue
+
+        a_tier = _tier(a_dev_id)
+        b_tier = _tier(b_dev_id)
+
+        if a_tier < b_tier:
+            parent, child = a_host, b_host
+        elif b_tier < a_tier:
+            parent, child = b_host, a_host
+        else:
+            # Same tier — use alphabetical order for determinism
+            parent, child = sorted([a_host, b_host])
+
+        # setdefault means: if the child already has a parent assigned (from a
+        # previous cable), keep the first one found and don't overwrite it.
+        # This prevents a switch from having multiple parents if it uplinks to
+        # more than one router (the first cable processed "wins").
+        parent_map.setdefault(child, parent)
+
+    logger.info(f"Built parent map: {len(parent_map)} child→parent relationships")
+    return parent_map
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +789,10 @@ def transform(data: dict, config: dict) -> dict:
             hosts.append(host)
             services.extend(_build_services(host, config))
             services.extend(_build_interface_services(host, data, config))
+            services.extend(_build_bgp_services(host, data, config))
+            services.extend(_build_ups_services(host, config))
+            services.extend(_build_memory_services(host, config))
+            services.extend(_build_ssl_services(host, config))
 
     # --- VMs ---
     for vm in data["vms"]:
@@ -356,8 +800,15 @@ def transform(data: dict, config: dict) -> dict:
         if host:
             hosts.append(host)
             services.extend(_build_services(host, config))
+            services.extend(_build_ssl_services(host, config))
 
-    hostgroups = _build_hostgroups(hosts)
+    # --- Parent-child topology ---
+    hostname_by_device_id = {h["nautobot_id"]: h["hostname"] for h in hosts if h["type"] == "device"}
+    parent_map = _build_parent_map(data, hostname_by_device_id)
+    for host in hosts:
+        host["parents"] = parent_map.get(host["hostname"], "")
+
+    hostgroups = _build_hostgroups(hosts, config)
 
     logger.info(
         f"Transformed {len(hosts)} hosts, "
@@ -378,7 +829,6 @@ def transform(data: dict, config: dict) -> dict:
 
 if __name__ == "__main__":
     import json
-    import yaml
     from dotenv import load_dotenv
     from fetcher import fetch_all, load_config
 

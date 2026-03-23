@@ -5,11 +5,13 @@ Connects to Nagios VM, runs nagios -v to validate, then reloads if clean.
 """
 
 import logging
-import os
+import re
+import shlex
 
-import paramiko
 import yaml
 from dotenv import load_dotenv
+
+from utils import get_ssh_client
 
 load_dotenv()
 
@@ -21,21 +23,9 @@ def load_config(path: str = "config.yaml") -> dict:
         return yaml.safe_load(f)
 
 
-def _get_ssh_client() -> paramiko.SSHClient:
-    host     = os.getenv("NAGIOS_SSH_HOST")
-    user     = os.getenv("NAGIOS_SSH_USER")
-    password = os.getenv("NAGIOS_SSH_PASSWORD")
-    port     = int(os.getenv("NAGIOS_SSH_PORT", 22))
-
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(hostname=host, port=port, username=user, password=password)
-    return client
-
-
-def _run(ssh: paramiko.SSHClient, cmd: str) -> tuple[int, str, str]:
+def _run(ssh, cmd: str) -> tuple[int, str, str]:
     """Run a command over SSH, return (exit_code, stdout, stderr)."""
-    stdin, stdout, stderr = ssh.exec_command(cmd)
+    _, stdout, stderr = ssh.exec_command(cmd)
     exit_code = stdout.channel.recv_exit_status()
     return exit_code, stdout.read().decode(), stderr.read().decode()
 
@@ -50,7 +40,7 @@ def validate_and_reload(config: dict) -> bool:
     reload_cmd = config["nagios"]["reload_command"]
 
     logger.info("Connecting to Nagios VM for validation...")
-    ssh = _get_ssh_client()
+    ssh = get_ssh_client()
 
     try:
         # Step 1: Validate config
@@ -58,7 +48,10 @@ def validate_and_reload(config: dict) -> bool:
         logger.info(f"Running: {validate_cmd}")
         exit_code, stdout, stderr = _run(ssh, validate_cmd)
 
-        if exit_code != 0 or "Total Errors:   0" not in stdout:
+        # re.search with \s+ handles varying whitespace between "Total Errors:" and
+        # the count across different Nagios versions (e.g. "Total Errors:   0" vs
+        # "Total Errors: 0").  A plain string check would miss unexpected spacing.
+        if exit_code != 0 or not re.search(r"Total Errors:\s+0", stdout):
             logger.error("Nagios config validation FAILED:")
             # Log only error lines
             for line in stdout.splitlines():

@@ -11,11 +11,13 @@ Writes locally to a temp dir, then SCPs to Nagios VM via paramiko.
 
 import logging
 import os
+import shlex
 import tempfile
 
-import paramiko
 import yaml
 from dotenv import load_dotenv
+
+from utils import get_ssh_client
 
 load_dotenv()
 
@@ -31,27 +33,7 @@ def load_config(path: str = "config.yaml") -> dict:
         return yaml.safe_load(f)
 
 
-# ---------------------------------------------------------------------------
-# SSH/SCP client
-# ---------------------------------------------------------------------------
-
-def _get_ssh_client() -> paramiko.SSHClient:
-    host     = os.getenv("NAGIOS_SSH_HOST")
-    user     = os.getenv("NAGIOS_SSH_USER")
-    password = os.getenv("NAGIOS_SSH_PASSWORD")
-    port     = int(os.getenv("NAGIOS_SSH_PORT", 22))
-
-    if not all([host, user, password]):
-        raise EnvironmentError("NAGIOS_SSH_HOST, NAGIOS_SSH_USER, NAGIOS_SSH_PASSWORD must be set in .env")
-
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(hostname=host, port=port, username=user, password=password)
-    logger.debug(f"SSH connected to {user}@{host}:{port}")
-    return client
-
-
-def _scp_file(sftp: paramiko.SFTPClient, local_path: str, remote_path: str):
+def _scp_file(sftp, local_path: str, remote_path: str):
     """Upload a single file via SFTP."""
     sftp.put(local_path, remote_path)
     logger.debug(f"SCP: {local_path} → {remote_path}")
@@ -79,6 +61,10 @@ def _render_host(host: dict, config: dict) -> str:
         f"    contact_groups          admins",
         f"    ; nautobot_id={host['nautobot_id']} type={host['type']} role={host['role']} method={host['check_method']}",
     ]
+    if host.get("parents"):
+        lines.append(f"    parents                 {host['parents']}")
+    if host.get("notes_url"):
+        lines.append(f"    notes_url               {host['notes_url']}")
     if host.get("comments"):
         lines.append(f"    notes                   {host['comments']}")
     lines.append("}")
@@ -121,6 +107,13 @@ def _render_hostgroup(hg: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def _write_local(path: str, content: str):
+    """Atomic file write: write to a temp file then rename over the target.
+
+    os.replace() is atomic on POSIX — Nagios will never see a half-written
+    config file even if we crash mid-write.  The temp file is in the same
+    directory so the rename is guaranteed to stay on the same filesystem
+    (cross-device renames would fail with EXDEV).
+    """
     dir_name = os.path.dirname(path)
     os.makedirs(dir_name, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
@@ -149,11 +142,23 @@ def write(result: dict, config: dict):
         "# ============================================================\n\n"
     )
 
+    # Command definition for check_snmp_int (manubulon plugin).
+    # Written alongside the other generated configs so Nagios picks it up automatically.
+    nagios_libexec = config["nagios"].get("nagios_libexec", "/usr/local/nagios/libexec")
+    commands_content = (
+        header
+        + "define command {\n"
+        + "    command_name    check_snmp_int\n"
+        + f"    command_line    {nagios_libexec}/check_snmp_int.pl -H $HOSTADDRESS$ $ARG1$\n"
+        + "}\n"
+    )
+
     # Build file contents
     files = {
-        "nautobot_hosts.cfg": _build_hosts_content(result, config, header),
-        "nautobot_services.cfg": _build_services_content(result, config, header),
+        "nautobot_hosts.cfg":     _build_hosts_content(result, config, header),
+        "nautobot_services.cfg":  _build_services_content(result, config, header),
         "nautobot_hostgroups.cfg": _build_hostgroups_content(result, header),
+        "nautobot_commands.cfg":  commands_content,
     }
 
     # Write to local temp dir
@@ -167,7 +172,7 @@ def write(result: dict, config: dict):
 
         # SCP to Nagios VM
         logger.info("Connecting to Nagios VM via SSH...")
-        ssh = _get_ssh_client()
+        ssh = get_ssh_client()
         try:
             sftp = ssh.open_sftp()
 
@@ -176,7 +181,7 @@ def write(result: dict, config: dict):
                 sftp.stat(remote_dir)
             except FileNotFoundError:
                 # mkdir -p via SSH
-                stdin, stdout, stderr = ssh.exec_command(f"sudo mkdir -p {remote_dir}")
+                _, stdout, _ = ssh.exec_command(f"sudo mkdir -p {shlex.quote(remote_dir)}")
                 stdout.channel.recv_exit_status()
 
             for fname, local_path in local_files.items():

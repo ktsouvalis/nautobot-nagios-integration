@@ -5,11 +5,11 @@ Returns a dict of host statuses and service statuses for use by map_generator.py
 """
 
 import logging
-import os
 
-import paramiko
 import yaml
 from dotenv import load_dotenv
+
+from utils import get_ssh_client
 
 load_dotenv()
 
@@ -19,18 +19,6 @@ logger = logging.getLogger(__name__)
 def load_config(path: str = "config.yaml") -> dict:
     with open(path, "r") as f:
         return yaml.safe_load(f)
-
-
-def _get_ssh_client() -> paramiko.SSHClient:
-    host     = os.getenv("NAGIOS_SSH_HOST")
-    user     = os.getenv("NAGIOS_SSH_USER")
-    password = os.getenv("NAGIOS_SSH_PASSWORD")
-    port     = int(os.getenv("NAGIOS_SSH_PORT", 22))
-
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(hostname=host, port=port, username=user, password=password)
-    return client
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +161,7 @@ def read_status(config: dict) -> dict:
     status_dat = config["nagios"]["status_dat"]
 
     logger.info(f"Reading {status_dat} from Nagios VM...")
-    ssh = _get_ssh_client()
+    ssh = get_ssh_client()
 
     try:
         stdin, stdout, stderr = ssh.exec_command(f"cat {status_dat}")

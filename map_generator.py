@@ -147,33 +147,24 @@ def _build_network_graph(result: dict, data: dict, config: dict) -> tuple[list, 
         ifname_b = iface_b.get("name", "?")
         short_a  = shorten_ifname(ifname_a)
         short_b  = shorten_ifname(ifname_b)
-        safe_a   = ifname_a.replace("/", "-").replace(" ", "_")
-        safe_b   = ifname_b.replace("/", "-").replace(" ", "_")
-        svc_a     = f"Interface {ifname_a} Status"    if iface_a.get("name") else None
-        svc_b     = f"Interface {ifname_b} Status"    if iface_b.get("name") else None
-        svc_a_in  = f"Interface {ifname_a} In Octets" if iface_a.get("name") else None
-        svc_a_out = f"Interface {ifname_a} Out Octets" if iface_a.get("name") else None
-        svc_b_in  = f"Interface {ifname_b} In Octets" if iface_b.get("name") else None
-        svc_b_out = f"Interface {ifname_b} Out Octets" if iface_b.get("name") else None
+        # Service descriptions must match what transformer._build_interface_services emits
+        svc_a = f"Interface {ifname_a} Traffic" if iface_a.get("name") else None
+        svc_b = f"Interface {ifname_b} Traffic" if iface_b.get("name") else None
 
         edges.append({
-            "from":      id_a,
-            "to":        id_b,
-            "title":     f"{hostname_a}:{ifname_a} ↔ {hostname_b}:{ifname_b}",
-            "label":     f"{short_a} ↔ {short_b}",
-            "font":      {"size": 9, "color": "#aaa", "align": "middle"},
-            "color":     {"color": "#7f8c8d"},
-            "width":     2,
-            "svc_a":     svc_a,
-            "svc_b":     svc_b,
-            "svc_a_in":  svc_a_in,
-            "svc_a_out": svc_a_out,
-            "svc_b_in":  svc_b_in,
-            "svc_b_out": svc_b_out,
-            "host_a":    hostname_a,
-            "host_b":    hostname_b,
-            "ifname_a":  ifname_a,
-            "ifname_b":  ifname_b,
+            "from":    id_a,
+            "to":      id_b,
+            "title":   f"{hostname_a}:{ifname_a} ↔ {hostname_b}:{ifname_b}",
+            "label":   f"{short_a} ↔ {short_b}",
+            "font":    {"size": 9, "color": "#aaa", "align": "middle"},
+            "color":   {"color": "#7f8c8d"},
+            "width":   2,
+            "svc_a":   svc_a,
+            "svc_b":   svc_b,
+            "host_a":  hostname_a,
+            "host_b":  hostname_b,
+            "ifname_a": ifname_a,
+            "ifname_b": ifname_b,
         })
 
     return nodes, edges
@@ -294,7 +285,7 @@ def _build_hosts_graph(result: dict, data: dict, config: dict) -> tuple[list, li
     return nodes, edges
 
 
-def _build_vm_graph(result: dict, data: dict) -> tuple[list, list]:
+def _build_vm_graph(result: dict) -> tuple[list, list]:
     """VMs connected to their hypervisor parent node."""
     nodes = []
     edges = []
@@ -522,7 +513,7 @@ const HOST_STATE_COLORS = {{
   8: "#e67e22",   // UNREACHABLE
 }};
 
-const prevOctets = {{}};  // {{ edgeId: {{ rxA, txA, ts }} }}
+
 async function refreshStatus() {{
   try {{
     const svcUrl  = `${{NAGIOS_URL}}/cgi-bin/statusjson.cgi?query=servicelist&details=true&hostname=all`;
@@ -572,16 +563,39 @@ async function refreshStatus() {{
     }});
     nodes.update(updates);
 
-    // Color edges based on interface STATUS, show RX/TX in tooltip
+    // Color edges based on check_snmp_int status; read RX/TX from plugin_output.
+    // check_snmp_int emits: IfName:UP (5.2KBps/3.3KBps):N UP: OK
+    // Rates are computed by the plugin on-disk between runs — no client-side math needed.
+    const fmtSpeed = bps => {{
+      if (bps === null) return '...';
+      if (bps < 1000) return bps.toFixed(0) + ' B/s';
+      if (bps < 1000000) return (bps/1000).toFixed(1) + ' KB/s';
+      if (bps < 1000000000) return (bps/1000000).toFixed(1) + ' MB/s';
+      return (bps/1000000000).toFixed(2) + ' GB/s';
+    }};
+    const getTraffic = (host, svc) => {{
+      const s = svclist[host]?.[svc];
+      if (!s) return {{ rx: null, tx: null }};
+      // check_snmp_int puts the rate summary on the last output line (may be in long_plugin_output)
+      const text = (s.plugin_output || '') + '\\n' + (s.long_plugin_output || '');
+      // matches "(5.2KBps/3.3KBps)" — rx first, tx second
+      const m = text.match(/\\(([\\d.]+)([KMGT]?)Bps\\/([\\d.]+)([KMGT]?)Bps\\)/);
+      if (!m) return {{ rx: null, tx: null }};
+      const mult = u => ({{ K: 1e3, M: 1e6, G: 1e9, T: 1e12 }}[u] || 1);
+      return {{ rx: parseFloat(m[1]) * mult(m[2]), tx: parseFloat(m[3]) * mult(m[4]) }};
+    }};
+
     const edgeUpdates = [];
     edges.getIds().forEach(id => {{
       const edge = edges.get(id);
       if (!edge.svc_a && !edge.svc_b) return;
+
       const states = [];
       if (edge.svc_a && svclist[edge.host_a]?.[edge.svc_a] !== undefined)
         states.push(svclist[edge.host_a][edge.svc_a].status);
       if (edge.svc_b && svclist[edge.host_b]?.[edge.svc_b] !== undefined)
         states.push(svclist[edge.host_b][edge.svc_b].status);
+
       let color;
       if      (states.length === 0)        color = "#95a5a6";
       else if (states.some(s => s === 16)) color = "#e74c3c";
@@ -589,34 +603,7 @@ async function refreshStatus() {{
       else if (states.every(s => s === 1)) color = "#2ecc71";
       else                                 color = "#95a5a6";
 
-      // Build RX/TX tooltip with throughput
-      const now = Date.now() / 1000;
-      const fmtSpeed = bps => {{
-        if (bps === null) return '...';
-        if (bps < 1000) return bps.toFixed(1) + ' KB/s';
-        if (bps < 1000000) return (bps/1000).toFixed(1) + ' MB/s';
-        return (bps/1000000).toFixed(1) + ' GB/s';
-      }};
-      const getRaw = (host, svc) => {{
-        const s = svclist[host]?.[svc]?.long_plugin_output || '';
-        const m = s.match(/SNMP OK - (\d+)/);
-        return m ? parseInt(m[1]) : null;
-      }};
-
-      const rxARaw = getRaw(edge.host_a, edge.svc_a_in);
-      const txARaw = getRaw(edge.host_a, edge.svc_a_out);
-      const prev   = prevOctets[id];
-      let rxSpeed = null, txSpeed = null;
-      if (prev && rxARaw !== null && txARaw !== null) {{
-        const dt = now - prev.ts;
-        if (dt > 0) {{
-          rxSpeed = (rxARaw - prev.rxA) / dt;
-          txSpeed = (txARaw - prev.txA) / dt;
-        }}
-      }}
-      if (rxARaw !== null && txARaw !== null)
-        prevOctets[id] = {{ rxA: rxARaw, txA: txARaw, ts: now }};
-
+      const {{ rx: rxSpeed, tx: txSpeed }} = getTraffic(edge.host_a, edge.svc_a);
       const tip = `${{edge.host_a}}:${{edge.ifname_a}} ↔ ${{edge.host_b}}:${{edge.ifname_b}}`
         + `\n↓ RX: ${{fmtSpeed(rxSpeed)}}`
         + `\n↑ TX: ${{fmtSpeed(txSpeed)}}`;
@@ -663,7 +650,7 @@ def generate_maps(result: dict, data: dict, config: dict):
         (
             config["maps"]["vm_map"],
             "ESDA Lab — VM Map",
-            *_build_vm_graph(result, data),
+            *_build_vm_graph(result),
         ),
         (
             config["maps"]["phone_map"],
