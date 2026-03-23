@@ -385,30 +385,31 @@ def _ifname_to_snmp_filter(ifname: str, hostname: str, config: dict) -> str:
     """
     Return the check_snmp_int -n filter string for an interface.
 
-    Most devices (Cisco etc.) expose ifDescr matching the Nautobot name directly,
-    so the name is returned as-is.
+    The value is treated as a Perl regex by check_snmp_int.pl, so anchors are
+    included to prevent substring false-positives (e.g. "1/0/1" matching 1/0/10…19).
+
+    Most devices (Cisco etc.) expose ifDescr matching the Nautobot name directly.
+    These get ^name$ anchors for exact matching.
 
     Some vendors (e.g. D-Link) use "Unit: X Slot: Y Port: Z Type - Level" in
     ifDescr.  List those device hostnames in snmp.unit_slot_port_devices and this
     function will convert GigabitEthernetU/S/P → "Unit: U Slot: S Port: P Gigabit",
     TenGigabitEthernetU/S/P → "Unit: U Slot: S Port: P 10G",
     Port-channelN → "Link Aggregate N".
+    For these devices the ifDescr has trailing text ("- Level: N") so only a ^
+    prefix anchor is used (no $ suffix).
     """
     usp_devices = [d.upper() for d in config.get("snmp", {}).get("unit_slot_port_devices", [])]
     if hostname.upper() not in usp_devices:
-        return ifname
+        return f"^{ifname}$"
 
     m = re.match(r"^(GigabitEthernet|TenGigabitEthernet|FastEthernet)(\d+)/(\d+)/(\d+)$", ifname)
     if m:
         prefix, unit, slot, port = m.group(1), m.group(2), m.group(3), m.group(4)
         type_str = {"GigabitEthernet": "Gigabit", "TenGigabitEthernet": "10G", "FastEthernet": "Fast Ethernet"}.get(prefix, prefix)
-        return f"Unit: {unit} Slot: {slot} Port: {port} {type_str}"
+        return f"^Unit: {unit} Slot: {slot} Port: {port} {type_str}"
 
-    m = re.match(r"^[Pp]ort-channel(\d+)$", ifname)
-    if m:
-        return f"Link Aggregate {m.group(1)}"
-
-    return ifname
+    return f"^{ifname}$"
 
 
 def _build_interface_services(host: dict, data: dict, config: dict) -> list:
@@ -449,6 +450,10 @@ def _build_interface_services(host: dict, data: dict, config: dict) -> list:
     for iface in interfaces:
         ifname = iface.get("name", "")
         if not ifname:
+            continue
+        # Port-channel (LAG) interfaces are skipped — their membership is already
+        # noted in the description of each member interface ("LAG: Port-channelN").
+        if re.match(r"^[Pp]ort-[Cc]hannel\d+$", ifname):
             continue
         safe_name = ifname.replace("/", "-").replace(" ", "_")
         lag_id   = (iface.get("lag") or {}).get("id", "")
