@@ -149,7 +149,12 @@ def write(result: dict, config: dict):
         header
         + "define command {\n"
         + "    command_name    check_snmp_int\n"
-        + f"    command_line    {nagios_libexec}/check_snmp_int.pl -H $HOSTADDRESS$ $ARG1$\n"
+        + f"    command_line    {nagios_libexec}/check_snmp_int.pl -H $HOSTADDRESS$ $ARG1$ -n '$ARG2$'\n"
+        + "}\n"
+        + "\n"
+        + "define command {\n"
+        + "    command_name    check_snmp_int_index\n"
+        + f"    command_line    {nagios_libexec}/check_snmp_int.pl -H $HOSTADDRESS$ $ARG1$ -i $ARG2$\n"
         + "}\n"
     )
 

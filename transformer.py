@@ -12,8 +12,12 @@ Uses field names confirmed from live Nautobot 2.x API output.
 import logging
 import os
 import re
+import subprocess
 
 logger = logging.getLogger(__name__)
+
+_ifindex_cache: dict = {}  # {(host_ip, community): {ifname: ifindex}}
+_IFINDEX_LINE_RE = re.compile(r".*?\.(\d+)\s*=\s*STRING:\s*\"?(.*?)\"?\s*$")
 
 
 # ---------------------------------------------------------------------------
@@ -38,7 +42,7 @@ def _snmp_auth_args(role: str, config: dict, for_snmp_int: bool = False) -> str:
     v3_roles    = [r.lower() for r in snmp_cfg.get("v3_roles", [])]
     cisco_roles = [r.lower() for r in snmp_cfg.get("cisco_roles", [])]
 
-    if v3_roles and any(r in role for r in v3_roles):
+    if v3_roles and role in v3_roles:
         user       = os.getenv("SNMP_V3_USER", "nagios")
         sec_level  = os.getenv("SNMP_V3_SEC_LEVEL", "authPriv")
         auth_proto = os.getenv("SNMP_V3_AUTH_PROTO", "SHA")
@@ -52,16 +56,69 @@ def _snmp_auth_args(role: str, config: dict, for_snmp_int: bool = False) -> str:
             f"-x {priv_proto} -X {priv_pass}"
         )
 
-    community = (
-        os.getenv("SNMP_COMMUNITY_CISCO", "public")
-        if any(r in role for r in cisco_roles)
-        else os.getenv("SNMP_COMMUNITY_DEFAULT", "public")
-    )
+    community = _get_snmp_community(role, config)
     if for_snmp_int:
         version = snmp_cfg.get("version", "2c")
         return f"-C {community} -2" if version == "2c" else f"-C {community}"
     version = snmp_cfg.get("version", "2c")
     return f"-C {community} -P {version}"
+
+
+# ---------------------------------------------------------------------------
+# SNMP ifIndex discovery (exact interface matching, avoids substring false positives)
+# ---------------------------------------------------------------------------
+
+def _get_snmp_community(role: str, config: dict) -> str:
+    """Return the SNMPv2c community string for the role, or '' for v3 devices."""
+    snmp_cfg = config.get("snmp", {})
+    v3_roles = [r.lower() for r in snmp_cfg.get("v3_roles", [])]
+    if role in v3_roles:
+        return ""  # v3 — snmpwalk command-line args differ, skip discovery
+    cisco_roles = [r.lower() for r in snmp_cfg.get("cisco_roles", [])]
+    cisco_community_roles = [r.lower() for r in snmp_cfg.get("cisco_community_roles", cisco_roles)]
+    return (
+        os.getenv("SNMP_COMMUNITY_CISCO", "public")
+        if role in cisco_community_roles
+        else os.getenv("SNMP_COMMUNITY_DEFAULT", "public")
+    )
+
+
+def _discover_ifindex_map(host_ip: str, community: str) -> dict:
+    """
+    Walk ifDescr (.1.3.6.1.2.1.2.2.1.2) via snmpwalk and return {ifname: ifindex}.
+
+    Using ifIndex with check_snmp_int -i avoids substring false positives:
+    e.g. filter "GigabitEthernet1/0/1" would otherwise also match
+    GigabitEthernet1/0/10 through 1/0/19.
+
+    Returns empty dict on any failure so the caller can fall back to -n name filter.
+    Results are cached per (host_ip, community) for the lifetime of the process.
+    """
+    cache_key = (host_ip, community)
+    if cache_key in _ifindex_cache:
+        return _ifindex_cache[cache_key]
+
+    mapping = {}
+    try:
+        result = subprocess.run(
+            ["snmpwalk", "-v2c", "-c", community, host_ip, ".1.3.6.1.2.1.2.2.1.2"],
+            capture_output=True, text=True, timeout=30,
+        )
+        for line in result.stdout.splitlines():
+            m = _IFINDEX_LINE_RE.match(line)
+            if m:
+                ifname = m.group(2).strip()
+                ifindex = int(m.group(1))
+                if ifname:
+                    mapping[ifname] = ifindex
+        logger.debug(f"ifIndex discovery: {host_ip} → {len(mapping)} interfaces mapped")
+    except FileNotFoundError:
+        logger.debug("snmpwalk not found — falling back to name-based interface filter")
+    except Exception as e:
+        logger.debug(f"ifIndex discovery failed for {host_ip}: {e}")
+
+    _ifindex_cache[cache_key] = mapping
+    return mapping
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +308,7 @@ def _build_services(host: dict, config: dict) -> list:
             },
         ]
         # Cisco-specific CPU OID — only for cisco_roles
-        if any(r in host["role"] for r in cisco_roles):
+        if host["role"] in cisco_roles:
             snmp_services.append({
                 "hostname":    hostname,
                 "service":     "SNMP-CPU",
@@ -382,21 +439,34 @@ def _build_interface_services(host: dict, data: dict, config: dict) -> list:
     # so the check only alerts on interface down, not on bandwidth saturation.
     warn_bps  = config["snmp"].get("int_warn_bps", 999999999)
     crit_bps  = config["snmp"].get("int_crit_bps", 999999999)
+    iface_name_by_id = data.get("_iface_name_by_id", {})
+
+    # Pre-discover ifIndex for exact interface matching (avoids substring false positives).
+    # Falls back to name-based filter if snmpwalk is unavailable or times out.
+    community  = _get_snmp_community(host["role"], config)
+    ifindex_map = _discover_ifindex_map(host["address"], community) if community else {}
 
     for iface in interfaces:
         ifname = iface.get("name", "")
         if not ifname:
             continue
-
-        snmp_filter = _ifname_to_snmp_filter(ifname, hostname, config)
         safe_name = ifname.replace("/", "-").replace(" ", "_")
-        # Anchor the regex so "Gi1/0/2" doesn't also match "Gi1/0/20", "Gi1/0/21" etc.
-        snmp_regex = f"^{snmp_filter}$"
+        lag_id   = (iface.get("lag") or {}).get("id", "")
+        lag_name = iface_name_by_id.get(lag_id, "")
+        description = f"Interface {ifname} Traffic" + (f" (LAG: {lag_name})" if lag_name else "")
+
+        ifindex = ifindex_map.get(ifname)
+        if ifindex:
+            check = f"check_snmp_int_index!{snmp_args} -k -f -w {warn_bps},{warn_bps} -c {crit_bps},{crit_bps}!{ifindex}"
+        else:
+            snmp_filter = _ifname_to_snmp_filter(ifname, hostname, config)
+            check = f"check_snmp_int!{snmp_args} -k -f -w {warn_bps},{warn_bps} -c {crit_bps},{crit_bps}!{snmp_filter}"
+
         services.append({
             "hostname":    hostname,
             "service":     f"IFACE-{safe_name}",
-            "check":       f"check_snmp_int!{snmp_args} -n {snmp_regex} -k -f -w {warn_bps},{warn_bps} -c {crit_bps},{crit_bps}",
-            "description": f"Interface {ifname} Traffic",
+            "check":       check,
+            "description": description,
         })
 
     return services
@@ -555,7 +625,7 @@ def _build_memory_services(host: dict, config: dict) -> list:
         return []
 
     cisco_roles = config["snmp"].get("cisco_roles", [])
-    is_cisco    = any(r in host["role"] for r in cisco_roles)
+    is_cisco    = host["role"] in cisco_roles
     snmp_args   = _snmp_auth_args(host["role"], config)
     hostname    = host["hostname"]
 

@@ -224,6 +224,9 @@ def fetch_all(config: dict) -> dict:
     data["_clusters_by_id"]  = {c["id"]: c for c in data["clusters"]}
     data["_ips_by_id"]       = {ip["id"]: ip for ip in data["ip_addresses"]}
 
+    # Build interface id→name lookup (used in transformer for LAG description)
+    data["_iface_name_by_id"] = {i["id"]: i["name"] for i in data["interfaces"]}
+
     # Build interface lookup by device id
     data["_interfaces_by_device"] = {}
     for iface in data["interfaces"]:

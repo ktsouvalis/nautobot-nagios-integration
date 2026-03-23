@@ -21,6 +21,7 @@ nautobot:
   # Device roles that will be monitored via SNMP
   snmp_roles:
     - "switch"
+    - "dell-switch"
     - "router"
     - "firewall"
     - "access-point"
@@ -67,7 +68,7 @@ nagios:
   service_template: "generic-service"
 
   # Check intervals (minutes)
-  check_interval: 5
+  check_interval: 10
   retry_interval: 1
   max_check_attempts: 3
 
@@ -86,6 +87,12 @@ snmp:
     - "switch"
     - "san"
 
+  # Roles that use SNMP_COMMUNITY_CISCO but are NOT Cisco devices (no Cisco OIDs)
+  cisco_community_roles:
+    - "switch"
+    - "san"
+    - "dell-switch"
+
   # Roles that use SNMPv3 instead of v2c (credentials come from .env)
   # Leave empty to use v2c for all roles
   v3_roles: []
@@ -100,6 +107,7 @@ snmp:
     - "router"
     - "firewall"
     - "access-point"
+    - "dell-switch"
   cisco_mem_warn_free_bytes: 10485760   # 10 MB
   cisco_mem_crit_free_bytes: 4194304    #  4 MB
 
@@ -201,6 +209,7 @@ hostgroups:
     alias: "Network Devices"
     roles:
       - "switch"
+      - "dell-switch"
       - "router"
       - "firewall"
       - "access-point"
@@ -235,6 +244,7 @@ maps:
   # Roles per map
   network_roles:
     - "switch"
+    - "dell-switch"
     - "router"
     - "firewall"
     - "access-point"
