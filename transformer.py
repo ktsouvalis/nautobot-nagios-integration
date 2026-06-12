@@ -765,7 +765,7 @@ def _build_hostgroups(hosts: list, config: dict = None) -> dict:
 # Parent-child topology builder
 # ---------------------------------------------------------------------------
 
-def _build_parent_map(data: dict, hostname_by_device_id: dict) -> dict:
+def _build_parent_map(data: dict, hostname_by_device_id: dict, config: dict = None) -> dict:
     """
     Parse cable data to build { child_hostname: parent_hostname } mapping.
 
@@ -774,10 +774,16 @@ def _build_parent_map(data: dict, hostname_by_device_id: dict) -> dict:
     are the same role tier, the one whose interface name sorts first is
     treated as parent (deterministic but arbitrary).
 
+    Roles listed under topology.child_roles in config.yaml are always treated
+    as children (tier=98) regardless of the default tier order.  Use this for
+    internal routing devices (e.g. ISR, MikroTik) that are physically
+    downstream of a switch from Nagios's reachability perspective.
+
     Only physical device-to-device cables are considered; VM and
     unresolvable endpoints are skipped.
     """
-    ROLE_TIER = {"router": 0, "firewall": 1, "switch": 2}
+    ROLE_TIER = {"firewall": 1, "switch": 2}
+    child_roles = [r.lower() for r in (config or {}).get("topology", {}).get("child_roles", [])]
     roles_by_id = data.get("_roles_by_id", {})
 
     def _tier(device_id: str) -> int:
@@ -787,30 +793,40 @@ def _build_parent_map(data: dict, hostname_by_device_id: dict) -> dict:
                 role_obj = dev.get("role", {})
                 role_id  = role_obj.get("id") if role_obj else None
                 role     = roles_by_id.get(role_id, {}).get("name", "").lower().replace(" ", "-") if role_id else ""
+                if any(cr in role for cr in child_roles):
+                    return 98
                 for key, t in ROLE_TIER.items():
                     if key in role:
                         return t
                 return 99
         return 99
 
+    # Build interface-by-id lookup for resolving cable terminations
+    ifaces_by_id = {i["id"]: i for i in data.get("interfaces", [])}
+
     parent_map = {}  # { child_hostname: parent_hostname }
 
     for cable in data.get("cables", []):
-        # Nautobot 2.x cable terminations
-        a_terms = cable.get("a_terminations", [])
-        b_terms = cable.get("b_terminations", [])
-        if not a_terms or not b_terms:
-            continue
-
-        a = a_terms[0]
-        b = b_terms[0]
+        # Nautobot 2.x: terminations stored as flat fields, not nested arrays
+        a_type = cable.get("termination_a_type", "")
+        b_type = cable.get("termination_b_type", "")
 
         # Only device interfaces (not circuits, console ports, etc.)
-        if a.get("object_type") != "dcim.interface" or b.get("object_type") != "dcim.interface":
+        if a_type != "dcim.interface" or b_type != "dcim.interface":
             continue
 
-        a_dev_id = a.get("object", {}).get("device", {}).get("id")
-        b_dev_id = b.get("object", {}).get("device", {}).get("id")
+        a_id = cable.get("termination_a_id") or (cable.get("termination_a") or {}).get("id")
+        b_id = cable.get("termination_b_id") or (cable.get("termination_b") or {}).get("id")
+        if not a_id or not b_id:
+            continue
+
+        a_iface = ifaces_by_id.get(a_id)
+        b_iface = ifaces_by_id.get(b_id)
+        if not a_iface or not b_iface:
+            continue
+
+        a_dev_id = (a_iface.get("device") or {}).get("id")
+        b_dev_id = (b_iface.get("device") or {}).get("id")
 
         if not a_dev_id or not b_dev_id or a_dev_id == b_dev_id:
             continue
@@ -879,9 +895,18 @@ def transform(data: dict, config: dict) -> dict:
 
     # --- Parent-child topology ---
     hostname_by_device_id = {h["nautobot_id"]: h["hostname"] for h in hosts if h["type"] == "device"}
-    parent_map = _build_parent_map(data, hostname_by_device_id)
+    parent_map = _build_parent_map(data, hostname_by_device_id, config)
+
+    # Build case-insensitive name→hostname lookup for VM→hypervisor mapping
+    hostname_by_name = {h["hostname"].upper(): h["hostname"] for h in hosts if h["type"] == "device"}
+
     for host in hosts:
-        host["parents"] = parent_map.get(host["hostname"], "")
+        if host["type"] == "device":
+            host["parents"] = parent_map.get(host["hostname"], "")
+        elif host["type"] == "vm":
+            # VMs store their hypervisor name in the Nautobot comments field
+            hypervisor = (host.get("comments") or "").strip()
+            host["parents"] = hostname_by_name.get(hypervisor.upper(), "")
 
     hostgroups = _build_hostgroups(hosts, config)
 

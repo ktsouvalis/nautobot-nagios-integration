@@ -260,6 +260,22 @@ maps:
     - "ip-phone"
 
 # =============================================================================
+# Topology / parent-child assignment
+# =============================================================================
+topology:
+  # Default role tiers used to decide parent vs child when a cable connects
+  # two devices:  lower tier = upstream = parent.
+  # router(0) > firewall(1) > switch(2) > everything else(99)
+  #
+  # child_roles: roles that should ALWAYS be treated as children (tier=98),
+  # overriding the default tier.  Use this for internal routing devices that
+  # are physically connected to a switch and depend on that switch to be
+  # reachable from Nagios (e.g. an ISR or MikroTik inside the LAN).
+  child_roles:
+    - "router"
+
+
+# =============================================================================
 # Logging
 # =============================================================================
 logging:
